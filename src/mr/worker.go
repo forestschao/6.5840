@@ -40,7 +40,6 @@ func Worker(mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
   for {
-    fmt.Println("Start to ask for task.")
     taskArgs := TaskArgs{}
     taskReply := TaskReply{}
 
@@ -63,7 +62,6 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func runMap(task TaskReply, mapf func(string, string) []KeyValue) {
-  fmt.Printf("Get Task: %v\n", task)
   // Map values
 	intermediates := make([][]KeyValue, task.ReduceNum)
 	for _, filename := range(task.Files) {
@@ -87,8 +85,6 @@ func runMap(task TaskReply, mapf func(string, string) []KeyValue) {
 
   // Save intermediate files
   for i, intermediate := range intermediates {
-    fmt.Println("Start to write file")
-
     tempFile, err := ioutil.TempFile("", "test-")
     if err != nil {
       fmt.Println("Error creating temporary file:", err)
@@ -116,8 +112,6 @@ func runMap(task TaskReply, mapf func(string, string) []KeyValue) {
 }
 
 func writeReduceResult(taskId int, kva []KeyValue, reducef func(string, []string) string) {
-  fmt.Println("Start to save file")
-
   tempFile, err := ioutil.TempFile("", "test-")
   if err != nil {
     fmt.Println("Error creating temporary file:", err)
@@ -154,7 +148,6 @@ func writeReduceResult(taskId int, kva []KeyValue, reducef func(string, []string
 }
 
 func runReduce(task TaskReply, reducef func(string, []string) string) {
-  fmt.Printf("Get Reduce Task: %v\n", task)
   // Read intermediate files
 	kva := []KeyValue{}
 	for _, filename := range(task.Files) {

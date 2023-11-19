@@ -7,6 +7,7 @@ import "os"
 import "net/rpc"
 import "net/http"
 import "sync"
+import "time"
 
 type TaskStatus int
 
@@ -17,9 +18,10 @@ const (
 )
 
 type Task struct {
-	id     int
-	file   string
-	status TaskStatus
+	id         int
+	file       string
+	status     TaskStatus
+  lastUpdate time.Time
 }
 
 type Coordinator struct {
@@ -72,7 +74,6 @@ func (c *Coordinator) Done() bool {
 // Caller should hold the mutex.
 func (c *Coordinator) scheduleMapTask(taskReply *TaskReply) error {
 	for id, task := range c.mapTasks {
-		fmt.Printf("Check task: %v\n", task)
 		if task.status == Idle {
       taskReply.TaskType = Map
 			taskReply.TaskId = task.id
@@ -80,6 +81,7 @@ func (c *Coordinator) scheduleMapTask(taskReply *TaskReply) error {
 			taskReply.ReduceNum = c.nReduce
 
 			c.mapTasks[id].status = InProgress
+			c.mapTasks[id].lastUpdate = time.Now()
 			break
 		}
 	}
@@ -98,13 +100,13 @@ func (c *Coordinator) getIntermediateFiles(reduceId int) []string {
 // Caller should hold the mutex.
 func (c *Coordinator) scheduleReduceTask(taskReply *TaskReply) error {
 	for id, task := range c.reduceTasks {
-		fmt.Printf("Check task: %v\n", task)
 		if task.status == Idle {
       taskReply.TaskType = Reduce
 			taskReply.TaskId = task.id
 			taskReply.Files = c.getIntermediateFiles(id)
 
 			c.reduceTasks[id].status = InProgress
+			c.reduceTasks[id].lastUpdate = time.Now()
 			break
 		}
 	}
@@ -118,7 +120,6 @@ func (c *Coordinator) scheduleExit(taskReply *TaskReply) error {
 }
 
 func (c *Coordinator) Schedule(taskArgs *TaskArgs, taskReply *TaskReply) error {
-	fmt.Printf("Start to scedule\n")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -134,7 +135,6 @@ func (c *Coordinator) Schedule(taskArgs *TaskArgs, taskReply *TaskReply) error {
 }
 
 func (c *Coordinator) Notify(notificationArgs *NotificationArgs, notificationReply *NotificationReply) error {
-	fmt.Printf("Start to update status\n")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -154,6 +154,33 @@ func (c *Coordinator) Notify(notificationArgs *NotificationArgs, notificationRep
 	return nil
 }
 
+func checkTasks(tasks []Task) {
+  for i, task := range(tasks) {
+    if task.status == InProgress {
+      duration := time.Now().Sub(task.lastUpdate)
+      if duration > 10 * time.Second {
+        tasks[i].status = Idle
+      }
+    }
+  }
+}
+
+func (c *Coordinator) PeriodicCheck() {
+  for {
+    c.mu.Lock()
+
+    if c.remainMapTask > 0 {
+      checkTasks(c.mapTasks[:])
+    } else if c.remainReduceTask > 0 {
+      checkTasks(c.reduceTasks[:])
+    }
+
+    c.mu.Unlock()
+
+    time.Sleep(time.Second)
+  }
+}
+
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
@@ -167,14 +194,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
   c.remainReduceTask = nReduce
 
 	for id, file := range files {
-		fmt.Printf("Add %d, file: %v\n", id, file)
 		task := Task{}
 		task.id = id
 		task.file = file
 		task.status = Idle
 		c.mapTasks = append(c.mapTasks, task)
 	}
-	fmt.Printf("mapTasks: %v\n", c.mapTasks)
 
   for i := 0; i < nReduce; i++ {
     reduceTask := Task{}
@@ -184,5 +209,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
     c.reduceTasks = append(c.reduceTasks, reduceTask)
   }
 	c.server()
+  go c.PeriodicCheck()
+
 	return &c
 }
