@@ -22,7 +22,35 @@ type ExampleReply struct {
 	Y int
 }
 
+type TaskType int
+
+const (
+  Map TaskType = iota
+  Reduce
+  Wait
+  Exit
+)
+
 // Add your RPC definitions here.
+type TaskArgs struct {
+  // Intentionally blank
+}
+
+type TaskReply struct {
+  TaskId    int
+  TaskType  TaskType
+  Files     []string
+  ReduceNum int
+}
+
+type NotificationArgs struct {
+  TaskType  TaskType
+  TaskId    int
+}
+
+type NotificationReply struct {
+  // Intentionally blank
+}
 
 
 // Cook up a unique-ish UNIX-domain socket name
