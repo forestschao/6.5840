@@ -88,7 +88,6 @@ func runMap(task TaskReply, mapf func(string, string) []KeyValue) {
   // Save intermediate files
   for i, intermediate := range intermediates {
     fmt.Println("Start to write file")
-    sort.Sort(ByKey(intermediate))
 
     tempFile, err := ioutil.TempFile("", "test-")
     if err != nil {
@@ -116,8 +115,73 @@ func runMap(task TaskReply, mapf func(string, string) []KeyValue) {
   notify(task)
 }
 
+func writeReduceResult(taskId int, kva []KeyValue, reducef func(string, []string) string) {
+  fmt.Println("Start to save file")
+
+  tempFile, err := ioutil.TempFile("", "test-")
+  if err != nil {
+    fmt.Println("Error creating temporary file:", err)
+    return
+  }
+
+  //
+  // call Reduce on each distinct key in intermediate[],
+  // and print the result to mr-out-0.
+  //
+  i := 0
+  for i < len(kva) {
+    j := i + 1
+    for j < len(kva) && kva[j].Key == kva[i].Key {
+      j++
+    }
+    values := []string{}
+    for k := i; k < j; k++ {
+      values = append(values, kva[k].Value)
+    }
+    output := reducef(kva[i].Key, values)
+
+    // this is the correct format for each line of Reduce output.
+    fmt.Fprintf(tempFile, "%v %v\n", kva[i].Key, output)
+
+    i = j
+  }
+
+  outputName := fmt.Sprintf("mr-out-%d", taskId)
+  if err := os.Rename(tempFile.Name(), outputName); err != nil {
+    fmt.Println("Error renaming temporary file:", err)
+    return
+  }
+}
+
 func runReduce(task TaskReply, reducef func(string, []string) string) {
-	// TODO
+  fmt.Printf("Get Reduce Task: %v\n", task)
+  // Read intermediate files
+	kva := []KeyValue{}
+	for _, filename := range(task.Files) {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		defer file.Close()
+
+    dec := json.NewDecoder(file)
+    for {
+      var kv KeyValue
+      if err := dec.Decode(&kv); err != nil {
+        break
+      }
+      kva = append(kva, kv)
+    }
+	}
+
+  sort.Sort(ByKey(kva))
+
+  // Save to output
+  writeReduceResult(task.TaskId, kva, reducef)
+
+
+  // Notifies coordinator
+  notify(task)
 }
 
 func notify(task TaskReply) {

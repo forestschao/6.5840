@@ -28,6 +28,7 @@ type Coordinator struct {
 	nReduce int
 
 	mapTasks []Task
+	reduceTasks []Task
 
   remainMapTask    int
   remainReduceTask int
@@ -68,22 +69,66 @@ func (c *Coordinator) Done() bool {
 	return c.remainMapTask == 0 && c.remainReduceTask == 0
 }
 
-func (c *Coordinator) Schedule(taskArgs *TaskArgs, taskReply *TaskReply) error {
-	fmt.Printf("Start to scedule\n")
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+// Caller should hold the mutex.
+func (c *Coordinator) scheduleMapTask(taskReply *TaskReply) error {
 	for id, task := range c.mapTasks {
 		fmt.Printf("Check task: %v\n", task)
 		if task.status == Idle {
-			taskReply.Files = append(taskReply.Files, task.file)
+      taskReply.TaskType = Map
 			taskReply.TaskId = task.id
+			taskReply.Files = append(taskReply.Files, task.file)
 			taskReply.ReduceNum = c.nReduce
 
 			c.mapTasks[id].status = InProgress
 			break
 		}
 	}
+  return nil
+}
+
+func (c *Coordinator) getIntermediateFiles(reduceId int) []string {
+  files := make([]string, 0)
+  for i := 0; i < len(c.files); i++ {
+    file := fmt.Sprintf("mr-%d-%d", i, reduceId)
+    files = append(files, file)
+  }
+  return files
+}
+
+// Caller should hold the mutex.
+func (c *Coordinator) scheduleReduceTask(taskReply *TaskReply) error {
+	for id, task := range c.reduceTasks {
+		fmt.Printf("Check task: %v\n", task)
+		if task.status == Idle {
+      taskReply.TaskType = Reduce
+			taskReply.TaskId = task.id
+			taskReply.Files = c.getIntermediateFiles(id)
+
+			c.reduceTasks[id].status = InProgress
+			break
+		}
+	}
+  return nil
+}
+
+// Caller should hold the mutex.
+func (c *Coordinator) scheduleExit(taskReply *TaskReply) error {
+  taskReply.TaskType = Exit
+  return nil
+}
+
+func (c *Coordinator) Schedule(taskArgs *TaskArgs, taskReply *TaskReply) error {
+	fmt.Printf("Start to scedule\n")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+  if c.remainMapTask > 0 {
+    c.scheduleMapTask(taskReply)
+  } else if c.remainReduceTask > 0 {
+    c.scheduleReduceTask(taskReply)
+  } else {
+    c.scheduleExit(taskReply)
+  }
 
 	return nil
 }
@@ -98,6 +143,11 @@ func (c *Coordinator) Notify(notificationArgs *NotificationArgs, notificationRep
     if c.mapTasks[notificationArgs.TaskId].status != Completed {
       c.mapTasks[notificationArgs.TaskId].status= Completed
       c.remainMapTask--
+    }
+  case Reduce:
+    if c.reduceTasks[notificationArgs.TaskId].status != Completed {
+      c.reduceTasks[notificationArgs.TaskId].status= Completed
+      c.remainReduceTask--
     }
   }
 
@@ -126,6 +176,13 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 	fmt.Printf("mapTasks: %v\n", c.mapTasks)
 
+  for i := 0; i < nReduce; i++ {
+    reduceTask := Task{}
+    reduceTask.id = i
+    reduceTask.status = Idle
+
+    c.reduceTasks = append(c.reduceTasks, reduceTask)
+  }
 	c.server()
 	return &c
 }

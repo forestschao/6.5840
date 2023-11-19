@@ -25,9 +25,9 @@ type ExampleReply struct {
 type TaskType int
 
 const (
-  Map TaskType = iota
+  Wait TaskType = iota
+  Map
   Reduce
-  Wait
   Exit
 )
 
