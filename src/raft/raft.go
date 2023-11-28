@@ -86,25 +86,25 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	currentTerm int // Latest term server has seen
-	votedFor    int // candidateId that received vote in current term
-	// or -1 if none
+	currentTerm  int // Latest term server has seen
+	votedFor     int // candidateId that received vote in current term
+	                 // or -1 if none
 	state        State     // current state of server
 	voteReceived int       // number of votes for the server received
 	lastUpdate   time.Time // true if received heartbeat from leader
-	// within the election timeout
+                         // within the election timeout
 
 	logs        []Log // log entries. First index is 1
 	commitIndex int   // index of highest log entry known to be committed
-	// (initialized to 0, increases monotonically)
-	lastApplied int // index of highest log entry applied to state
-	// machine (intialized to 0, increases monotonically)
-	nextIndex []int // for each server, index of the next log entry to
-	// send to that server (initialized to leader last
-	// log index + 1
-	matchIndex []int // for each server, index of highest log entry known
-	// to be replicated on server (initialized to 0,
-	// increases monotonically)
+	                  // (initialized to 0, increases monotonically)
+	lastApplied int   // index of highest log entry applied to state
+                    // machine (intialized to 0, increases monotonically)
+	nextIndex   []int // for each server, index of the next log entry to
+	                  // send to that server (initialized to leader last
+	                  // log index + 1
+	matchIndex  []int // for each server, index of highest log entry known
+	                  // to be replicated on server (initialized to 0,
+	                  // increases monotonically)
 	applyCh chan ApplyMsg
 }
 
@@ -216,7 +216,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.voteReceived = 0
 	}
 
-	if rf.votedFor == -1 && rf.isUpToDate(args) {
+	if rf.isUpToDate(args) && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		rf.votedFor = args.CandidateId
 		rf.lastUpdate = time.Now()
 
@@ -272,10 +272,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
     return ok
   }
 
-	if reply.VoteGranted {
+	if reply.VoteGranted && rf.state != Leader {
 		rf.voteReceived++
 
-		if rf.state != Leader && rf.voteReceived > len(rf.peers)/2 {
+		if rf.voteReceived > len(rf.peers)/2 {
 			rf.state = Leader
 
 			rf.nextIndex = make([]int, len(rf.peers))
@@ -284,7 +284,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			}
 
 			rf.matchIndex = make([]int, len(rf.peers))
-      PrintDebug("nextIndex: %v", rf.nextIndex)
 
       // Send empty AppendEntries
       go rf.sendUpdates()
@@ -306,7 +305,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex
-	// and prevLogTerm
+	             // and prevLogTerm
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -315,7 +314,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = false
 
-  PrintDebug("%v receive AppendEntries", rf.me)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
@@ -332,8 +330,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-  PrintDebug("%v AppendEntries: update", rf.me)
-
 	reply.Success = true
 
 	i, j := args.PrevLogIndex+1, 0
@@ -345,7 +341,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		j++
 	}
 
-  PrintDebug("%v AppendEntries: i: %v, j: %v", rf.me, i, j)
 	if j < len(args.Entries) {
 		if i < len(rf.logs) {
 			rf.logs = rf.logs[:i]
@@ -371,9 +366,7 @@ func (rf *Raft) commitLog(log Log, index int) {
 	msg.Command = log.Command
 	msg.CommandIndex = index
 
-  PrintDebug("%v start commitLog: %v, index: %v, msg: %v", rf.me, rf.logs, index, msg)
 	rf.applyCh <- msg
-  PrintDebug("%v finish commitLog: %v, index: %v", rf.me, rf.logs, index)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -398,7 +391,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
   }
 
 	if !reply.Success {
-    PrintDebug("%v -> %v: nextIndex--", rf.me, server)
 		rf.nextIndex[server]--
 	} else {
 		rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
@@ -508,14 +500,13 @@ func (rf *Raft) makeAppendEntriesArgs(peer int) AppendEntriesArgs {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
 
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.state != Leader {
-		return index, term, false
+		return index, term, /*isLeader=*/false
 	}
 
 	newLog := Log{}
@@ -526,7 +517,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
   PrintDebug("%v Start command: [term: %v, logs: %v]", rf.me, newLog.Term, rf.logs)
 	go rf.sendUpdates()
 
-	return len(rf.logs) - 1, newLog.Term, isLeader
+	return /*index=*/len(rf.logs) - 1,
+         /*term=*/newLog.Term,
+         /*isLeader=*/true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
