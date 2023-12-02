@@ -18,19 +18,19 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
 const heartbeatTimeout = 100
-const DebugMode = false
+const DebugMode = true
 
 func PrintDebug(format string, a ...interface{}) {
   if !DebugMode {
@@ -134,6 +134,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -154,6 +161,26 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+  PrintDebug("%v start to read persist", rf.me)
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+  var logs []Log
+	if d.Decode(&currentTerm) != nil ||
+	   d.Decode(&votedFor) != nil ||
+     d.Decode(&logs) != nil {
+    PrintDebug("Fail to read persist")
+	} else {
+	  rf.currentTerm = currentTerm
+	  rf.votedFor = votedFor
+	  rf.logs = logs
+	}
+
+  rf.commitIndex = 0
+  rf.lastApplied = 0
+
+  PrintDebug("%v read persist: logs: %v", rf.me, len(rf.logs))
 }
 
 // the service says it has created a snapshot that has
@@ -209,19 +236,31 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = args.Term
 
+  isUpdated := false
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.voteReceived = 0
+
+    isUpdated = true
 	}
 
 	if rf.isUpToDate(args) && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
+    if rf.votedFor == -1 {
+      isUpdated = true
+    }
+
 		rf.votedFor = args.CandidateId
 		rf.lastUpdate = time.Now()
 
 		reply.VoteGranted = true
+
 	}
+
+  if isUpdated {
+    rf.persist()
+  }
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -265,6 +304,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.voteReceived = 0
+
+    rf.persist()
 		return ok
 	}
 
@@ -356,8 +397,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitLog(rf.logs[i], i)
 		i++
 	}
+  rf.persist()
 
 	rf.commitIndex = i - 1
+
 }
 
 func (rf *Raft) commitLog(log Log, index int) {
@@ -382,6 +425,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.voteReceived = 0
+
+    rf.persist()
 		return ok
 	}
 
@@ -514,6 +559,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	newLog.Command = command
 	rf.logs = append(rf.logs, newLog)
 
+  rf.persist()
+
   PrintDebug("%v Start command: [term: %v, logs: %v]", rf.me, newLog.Term, rf.logs)
 	go rf.sendUpdates()
 
@@ -564,6 +611,8 @@ func (rf *Raft) checkLeader() {
 		rf.currentTerm++
 		rf.votedFor = rf.me
 		rf.voteReceived = 1
+
+    rf.persist()
 
 		for id, _ := range rf.peers {
 			if id == rf.me {
@@ -618,14 +667,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Avoid start up competition
 	rf.lastUpdate = time.Now()
 
-	// Insert an empty log
-	emptyLog := Log{}
-	rf.logs = append(rf.logs, emptyLog)
-
 	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+  if len(rf.logs) == 0 {
+    // Insert an empty log
+    emptyLog := Log{}
+    rf.logs = append(rf.logs, emptyLog)
+  }
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
