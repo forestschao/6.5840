@@ -30,7 +30,7 @@ import (
 )
 
 const heartbeatTimeout = 100
-const DebugMode = true
+const DebugMode = false
 
 func PrintDebug(format string, a ...interface{}) {
   if !DebugMode {
@@ -38,6 +38,14 @@ func PrintDebug(format string, a ...interface{}) {
   }
 	curr := time.Now().Format("15:04:05.000")
 	fmt.Printf("%s %s\n", curr, fmt.Sprintf(format, a...))
+}
+
+func PrintDebugRed(format string, a ...interface{}) {
+  if !DebugMode {
+    return
+  }
+	curr := time.Now().Format("15:04:05.000")
+	fmt.Printf("\033[31m%s %s\033[0m\n", curr, fmt.Sprintf(format, a...))
 }
 
 // as each Raft peer becomes aware that successive log entries are
@@ -146,6 +154,9 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+    // Insert an empty log
+    emptyLog := Log{}
+    rf.logs = append(rf.logs, emptyLog)
 		return
 	}
 	// Your code here (2C).
@@ -347,6 +358,30 @@ type AppendEntriesReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex
 	             // and prevLogTerm
+
+  XTerm        int // term in the conflicting entry (if any)
+  XIndex       int // index of first entry with that term (if any)
+  XLen         int // log length
+}
+
+// Caller must hold mutex.
+func (rf *Raft) fillConflictTerm(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+  reply.XTerm = -1
+  reply.XIndex = -1
+  reply.XLen = len(rf.logs)
+
+  prevIndex := args.PrevLogIndex
+  if len(rf.logs) <= prevIndex {
+    return
+  }
+
+  reply.XTerm = rf.logs[prevIndex].Term
+
+  firstIndex := prevIndex
+  for firstIndex >= 0 && rf.logs[firstIndex].Term == reply.XTerm {
+    firstIndex--
+  }
+  reply.XIndex = firstIndex + 1
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -368,6 +403,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(rf.logs) <= args.PrevLogIndex ||
 		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
       PrintDebug("%v AppendEntries failed: no prev log found. prevIndex: %v, prevTerm: %v, rf.logs: %v", rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.logs)
+    rf.fillConflictTerm(args, reply)
 		return
 	}
 
@@ -412,6 +448,35 @@ func (rf *Raft) commitLog(log Log, index int) {
 	rf.applyCh <- msg
 }
 
+// Caller must hold mutex.
+func (rf *Raft) updateNextIndex(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+  PrintDebug("%v updateNextIndex: XTerm: %v, XIndex: %v, XLen: %v", server, reply.XTerm, reply.XIndex, reply.XLen)
+
+  originIndex := rf.nextIndex[server]
+  nextIndex := &rf.nextIndex[server]
+
+  // follower's log is too short.
+  if reply.XTerm == -1 {
+    *nextIndex = reply.XLen
+    PrintDebug("%v [too short] original index: %v, update index: %v", server, originIndex, rf.nextIndex[server])
+    return
+  }
+
+  lastIndex := args.PrevLogIndex
+  for lastIndex >= 0 && rf.logs[lastIndex].Term > reply.XTerm {
+    lastIndex--
+  }
+
+  if lastIndex >= 0 && rf.logs[lastIndex].Term == reply.XTerm {
+    // leader has XTerm
+    *nextIndex = lastIndex
+  } else {
+    // leader doesn't have XTerm
+    *nextIndex = reply.XIndex
+  }
+  PrintDebug("%v [conflict] original index: %v, update index: %v", server, originIndex, rf.nextIndex[server])
+}
+
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
   PrintDebug("start to sendAppendEntries %v -> %v: [term: %v, prevId: %v, prevTerm: %v, commit: %v]", rf.me, server, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 
@@ -436,7 +501,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
   }
 
 	if !reply.Success {
-		rf.nextIndex[server]--
+    rf.updateNextIndex(server, args, reply)
 	} else {
 		rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
@@ -671,12 +736,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-  if len(rf.logs) == 0 {
-    // Insert an empty log
-    emptyLog := Log{}
-    rf.logs = append(rf.logs, emptyLog)
-  }
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
