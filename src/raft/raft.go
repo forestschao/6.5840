@@ -201,7 +201,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-	PrintDebug("%v start to read persist", rf.me)
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm, votedFor int
@@ -597,7 +596,6 @@ func (rf *Raft) commitLog(log Log, logIndex int) {
 	msg.Command = log.Command
 	msg.CommandIndex = logIndex
 
-  PrintDebugGreen("    %v: commit log: %v", rf.me, logIndex)
 	rf.applyCh <- msg
   PrintDebugGreen(
     "    %v: commit log: %v done", rf.me, logIndex)
@@ -768,17 +766,13 @@ func (rf *Raft) sendInstallSnapshot(
   args *InstallSnapshotArgs,
   reply *InstallSnapshotReply,
 ) bool {
-  PrintDebugGreen(
+  PrintDebug(
     "Send installSnapshot: %v -> %v, lastId: %v, lastTerm: %v",
   rf.me, server, args.LastIncludedIndex, args.LastIncludedTerm)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-  PrintDebugGreen(
-    "Receive installSnapshot: %v -> %v, lastId: %v, lastTerm: %v",
-  rf.me, server, args.LastIncludedIndex, args.LastIncludedTerm)
 
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
@@ -803,7 +797,7 @@ func (rf *Raft) InstallSnapshot(
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-  PrintDebugGreen(
+  PrintDebug(
     "%v InstallSnapshot: lastId: %v, lastTerm: %v",
     rf.me, args.LastIncludedIndex, args.LastIncludedTerm)
 
@@ -851,9 +845,6 @@ func (rf *Raft) commitSnapshot(args *InstallSnapshotArgs) {
   msg.SnapshotTerm = args.LastIncludedTerm
   msg.SnapshotIndex = args.LastIncludedIndex
 
-  PrintDebugGreen(
-    "commitSnapshot: lastId: %v, lastTerm: %v",
-    args.LastIncludedIndex, args.LastIncludedTerm)
   rf.applyCh <- msg
   PrintDebugGreen(
     "commitSnapshot: lastId: %v, lastTerm: %v done",
