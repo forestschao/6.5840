@@ -30,7 +30,8 @@ import (
 )
 
 const heartbeatTimeout = 100
-const DebugMode = true
+const commitInterval = 10
+const DebugMode = false
 
 func PrintDebug(format string, a ...interface{}) {
 	if !DebugMode {
@@ -179,10 +180,12 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+    rf.commitIndex = 0
+    rf.lastApplied = 0
+
 		rf.startIndex = 1
 		rf.lastIncludedIndex = 0
 		rf.lastIncludedTerm = 0
-
 		return
 	}
 	// Your code here (2C).
@@ -535,21 +538,22 @@ func (rf *Raft) updateLogs(args *AppendEntriesArgs) {
 		rf.logs = append(rf.logs, args.Entries[j:]...)
 	}
 	PrintDebug("%v AppendEntries result logs size: %v", rf.me, len(rf.logs))
+
+  rf.persist()
 }
 
 // Caller must hold the mutex.
-func (rf *Raft) updateState(args *AppendEntriesArgs) {
+func (rf *Raft) updateCommitId(args *AppendEntriesArgs) {
+  candidate := args.LeaderCommit
+
 	lastNewLogIndex := args.PrevLogIndex + len(args.Entries)
+  if candidate > lastNewLogIndex {
+    candidate = lastNewLogIndex
+  }
 
-  // commitIndex is always >= rf.lastIncludedIndex
-  i := rf.commitIndex + 1
-	for i <= args.LeaderCommit && i <= lastNewLogIndex {
-		rf.commitLog(rf.logs[rf.getArrayIndex(i)], i)
-		i++
-	}
-	rf.persist()
-
-	rf.commitIndex = i - 1
+  if rf.commitIndex < candidate {
+    rf.commitIndex = candidate
+  }
 }
 
 func (rf *Raft) AppendEntries(
@@ -584,7 +588,7 @@ func (rf *Raft) AppendEntries(
 
   rf.updateLogs(args)
 
-  rf.updateState(args)
+  rf.updateCommitId(args)
 }
 
 func (rf *Raft) commitLog(log Log, logIndex int) {
@@ -731,9 +735,6 @@ func (rf *Raft) updateCommit() {
 		minMatch := rf.getArrayIndex(minMatchLogIndex)
 
 		if rf.logs[minMatch].Term == rf.currentTerm {
-			for i := rf.commitIndex + 1; i <= minMatchLogIndex; i++ {
-				rf.commitLog(rf.logs[rf.getArrayIndex(i)], i)
-			}
 			rf.commitIndex = minMatchLogIndex
 		}
 	}
@@ -761,6 +762,29 @@ func (rf *Raft) heartbeats() {
 		rf.sendUpdates()
 
 		time.Sleep(heartbeatTimeout * time.Millisecond)
+	}
+}
+
+func (rf *Raft) commit() {
+	for {
+    rf.mu.Lock()
+    commitIndex := rf.commitIndex
+    rf.mu.Unlock()
+
+    for rf.lastApplied < commitIndex {
+      rf.lastApplied++
+
+      rf.mu.Lock()
+
+      arrayIndex := rf.getArrayIndex(rf.lastApplied)
+      log := rf.logs[arrayIndex]
+
+      rf.mu.Unlock()
+
+      rf.commitLog(log, rf.lastApplied)
+    }
+
+		time.Sleep(commitInterval * time.Millisecond)
 	}
 }
 
@@ -948,6 +972,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartbeats()
+  go rf.commit()
 
 	return rf
 }
