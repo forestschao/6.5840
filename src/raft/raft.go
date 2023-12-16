@@ -740,6 +740,126 @@ func (rf *Raft) updateCommit() {
 	}
 }
 
+type InstallSnapshotArgs struct {
+  Term              int // leader's term
+  LeaderId          int
+  LastIncludedIndex int
+  LastIncludedTerm  int
+  Data              []byte
+}
+
+type InstallSnapshotReply struct {
+  Term int
+}
+
+// Caller must hold the mutex.
+func (rf *Raft) makeInstallSnapshotArgs() InstallSnapshotArgs {
+  args := InstallSnapshotArgs{}
+  args.Term = rf.currentTerm
+  args.LeaderId = rf.me
+  args.LastIncludedIndex = rf.lastIncludedIndex
+  args.LastIncludedTerm = rf.lastIncludedTerm
+  args.Data = clone(rf.snapshot)
+  return args
+}
+
+func (rf *Raft) sendInstallSnapshot(
+  server int,
+  args *InstallSnapshotArgs,
+  reply *InstallSnapshotReply,
+) bool {
+  PrintDebugGreen(
+    "Send installSnapshot: %v -> %v, lastId: %v, lastTerm: %v",
+  rf.me, server, args.LastIncludedIndex, args.LastIncludedTerm)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+  PrintDebugGreen(
+    "Receive installSnapshot: %v -> %v, lastId: %v, lastTerm: %v",
+  rf.me, server, args.LastIncludedIndex, args.LastIncludedTerm)
+
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.voteReceived = 0
+
+		rf.persist()
+	  return ok
+	}
+
+  rf.nextIndex[server] = args.LastIncludedIndex + 1
+  rf.matchIndex[server] = args.LastIncludedIndex
+
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(
+  args *InstallSnapshotArgs,
+  reply *InstallSnapshotReply,
+) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+  PrintDebugGreen(
+    "%v InstallSnapshot: lastId: %v, lastTerm: %v",
+    rf.me, args.LastIncludedIndex, args.LastIncludedTerm)
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+  rf.state = Follower
+  rf.lastUpdate = time.Now()
+
+  // If follower's snapshot contains the leader's snapshot
+  if rf.lastIncludedIndex >= args.LastIncludedIndex {
+    return
+  }
+
+  // If follower's log contains the leader's snapshot
+  lastLogIndex := rf.getLastLogIndex()
+  if lastLogIndex >= args.LastIncludedIndex {
+    arrayIndex := rf.getArrayIndex(args.LastIncludedIndex)
+    if rf.logs[arrayIndex].Term == args.LastIncludedTerm {
+      return
+    }
+  }
+
+  // Discard the entire logs.
+  rf.logs = rf.logs[:0]
+  rf.lastIncludedTerm = args.LastIncludedTerm
+  rf.lastIncludedIndex = args.LastIncludedIndex
+  rf.startIndex = args.LastIncludedIndex + 1
+  rf.snapshot = clone(args.Data)
+
+  rf.persist()
+
+  rf.commitIndex = args.LastIncludedIndex
+  rf.lastApplied = args.LastIncludedIndex
+
+  rf.commitSnapshot(args)
+}
+
+func (rf *Raft) commitSnapshot(args *InstallSnapshotArgs) {
+  msg := ApplyMsg{}
+  msg.SnapshotValid = true
+  msg.Snapshot = clone(args.Data)
+  msg.SnapshotTerm = args.LastIncludedTerm
+  msg.SnapshotIndex = args.LastIncludedIndex
+
+  PrintDebugGreen(
+    "commitSnapshot: lastId: %v, lastTerm: %v",
+    args.LastIncludedIndex, args.LastIncludedTerm)
+  rf.applyCh <- msg
+  PrintDebugGreen(
+    "commitSnapshot: lastId: %v, lastTerm: %v done",
+    args.LastIncludedIndex, args.LastIncludedTerm)
+}
+
 func (rf *Raft) sendUpdates() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -750,9 +870,15 @@ func (rf *Raft) sendUpdates() {
 				continue
 			}
 
-			args := rf.makeAppendEntriesArgs(id)
-			reply := AppendEntriesReply{}
-			go rf.sendAppendEntries(id, &args, &reply)
+      if rf.nextIndex[id] >= rf.startIndex {
+        args := rf.makeAppendEntriesArgs(id)
+        reply := AppendEntriesReply{}
+        go rf.sendAppendEntries(id, &args, &reply)
+      } else {
+        args := rf.makeInstallSnapshotArgs()
+        reply := InstallSnapshotReply{}
+        go rf.sendInstallSnapshot(id, &args, &reply)
+      }
 		}
 	}
 }
@@ -788,7 +914,7 @@ func (rf *Raft) commit() {
 	}
 }
 
-// Caller must hold the mutex
+// Caller must hold the mutex.
 func (rf *Raft) makeAppendEntriesArgs(peer int) AppendEntriesArgs {
 	args := AppendEntriesArgs{}
 	args.Term = rf.currentTerm
