@@ -30,7 +30,7 @@ import (
 )
 
 const heartbeatTimeout = 100
-const DebugMode = false
+const DebugMode = true
 
 func PrintDebug(format string, a ...interface{}) {
 	if !DebugMode {
@@ -46,6 +46,22 @@ func PrintDebugRed(format string, a ...interface{}) {
 	}
 	curr := time.Now().Format("15:04:05.000")
 	fmt.Printf("\033[31m%s %s\033[0m\n", curr, fmt.Sprintf(format, a...))
+}
+
+func PrintDebugGreen(format string, a ...interface{}) {
+	if !DebugMode {
+		return
+	}
+	curr := time.Now().Format("15:04:05.000")
+	fmt.Printf("\033[32m%s %s\033[0m\n", curr, fmt.Sprintf(format, a...))
+}
+
+func PrintDebugYellow(format string, a ...interface{}) {
+	if !DebugMode {
+		return
+	}
+	curr := time.Now().Format("15:04:05.000")
+	fmt.Printf("\033[33m%s %s\033[0m\n", curr, fmt.Sprintf(format, a...))
 }
 
 // as each Raft peer becomes aware that successive log entries are
@@ -119,6 +135,7 @@ type Raft struct {
 	                      // Initialized to 1.
 	lastIncludedTerm  int // Last included term of the latest snapshot.
 	lastIncludedIndex int // Last included index of the latest snapshot.
+  snapshot          []byte // Latest snapshot. Initialized to nil.
 }
 
 // return currentTerm and whether this server
@@ -156,7 +173,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.lastIncludedIndex)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -165,6 +182,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.startIndex = 1
 		rf.lastIncludedIndex = 0
 		rf.lastIncludedTerm = 0
+
 		return
 	}
 	// Your code here (2C).
@@ -215,7 +233,30 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+  rf.mu.Lock()
+  defer rf.mu.Unlock()
 
+  arrayIndex := rf.getArrayIndex(index)
+  if arrayIndex <= 0 {
+    return
+  }
+
+  rf.lastIncludedIndex = index
+  rf.lastIncludedTerm = rf.logs[arrayIndex].Term
+  rf.startIndex = rf.lastIncludedIndex + 1
+
+  rf.logs = rf.logs[arrayIndex + 1:]
+
+  rf.snapshot = clone(snapshot)
+
+  PrintDebugYellow(
+    "%v: Snapshot: logIndex: %v, arrayIndex: %v " +
+    "lastIndex: %v, lastTerm: %v, startIndex: %v, " +
+    "log size: %v",
+    rf.me, index, arrayIndex, rf.lastIncludedIndex,
+    rf.lastIncludedTerm, rf.startIndex, len(rf.logs))
+
+  rf.persist()
 }
 
 // example RequestVote RPC arguments structure.
@@ -283,7 +324,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	PrintDebug("server: %v Get RequestVote: term: %v, candidate: %v", rf.me, args.Term, args.CandidateId)
+	PrintDebug(
+    "server: %v Get RequestVote: term: %v, candidate: %v",
+    rf.me, args.Term, args.CandidateId)
 
 	reply.VoteGranted = false
 
@@ -304,7 +347,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		isUpdated = true
 	}
 
-	if rf.isUpToDate(args) && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
+	if rf.isUpToDate(args) &&
+    (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		if rf.votedFor == -1 {
 			isUpdated = true
 		}
@@ -349,7 +393,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	PrintDebug("server: %v -> %v StartVote. term: %v", rf.me, server, args.Term)
+	PrintDebugRed(
+    "server: %v -> %v StartVote. term: %v", rf.me, server, args.Term)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
 	rf.mu.Lock()
@@ -489,7 +534,7 @@ func (rf *Raft) updateLogs(args *AppendEntriesArgs) {
 
 		rf.logs = append(rf.logs, args.Entries[j:]...)
 	}
-	PrintDebug("%v AppendEntries result logs: %v", rf.me, rf.logs)
+	PrintDebug("%v AppendEntries result logs size: %v", rf.me, len(rf.logs))
 }
 
 // Caller must hold the mutex.
@@ -548,7 +593,10 @@ func (rf *Raft) commitLog(log Log, logIndex int) {
 	msg.Command = log.Command
 	msg.CommandIndex = logIndex
 
+  PrintDebugGreen("    %v: commit log: %v", rf.me, logIndex)
 	rf.applyCh <- msg
+  PrintDebugGreen(
+    "    %v: commit log: %v done", rf.me, logIndex)
 }
 
 // Caller must hold mutex.
@@ -599,9 +647,9 @@ func (rf *Raft) sendAppendEntries(
 ) bool {
 	PrintDebug(
     "start to sendAppendEntries %v -> %v: " + 
-    "[term: %v, prevId: %v, prevTerm: %v, commit: %v]",
+    "[term: %v, prevId: %v, prevTerm: %v, commit: %v, log size: %v]",
     rf.me, server, args.Term, args.PrevLogIndex, 
-    args.PrevLogTerm, args.LeaderCommit)
+    args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 
@@ -626,13 +674,21 @@ func (rf *Raft) sendAppendEntries(
 	if !reply.Success {
 		rf.updateNextIndex(server, args, reply)
 	} else {
-		rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-		rf.matchIndex[server] = rf.nextIndex[server] - 1
+    matchLogIndex := args.PrevLogIndex + len(args.Entries)
 
-		PrintDebug(
-      "%v -> %v: succeed to append entries: next: %v, match: %v",
-      rf.me, server, rf.nextIndex[server], rf.matchIndex[server])
-		rf.updateCommit()
+    if matchLogIndex > rf.matchIndex[server] {
+      rf.matchIndex[server] = matchLogIndex
+
+      PrintDebug(
+        "%v -> %v: succeed to append entries: match: %v",
+        rf.me, server, rf.matchIndex[server])
+      rf.updateCommit()
+    }
+
+    nextLogIndex := matchLogIndex + 1
+    if nextLogIndex > rf.nextIndex[server] {
+      rf.nextIndex[server] = nextLogIndex
+    }
 	}
 	return ok
 }
@@ -660,14 +716,16 @@ func (rf *Raft) isMajority(targetLogIndex int) bool {
 // Caller must hold the mutex.
 func (rf *Raft) updateCommit() {
 	minMatchLogIndex := rf.commitIndex + 1
+
 	for rf.isMajority(minMatchLogIndex) {
 		minMatchLogIndex++
 	}
 
 	minMatchLogIndex--
-	PrintDebug(
-    "%v: updateCommit: %v, logs: %v, commitIndex: %v",
-    rf.me, minMatchLogIndex, rf.logs, rf.commitIndex)
+	PrintDebugGreen(
+    "%v: updateCommit: matchIndex: %v, logs size: %v, " +
+    "commitIndex: %v",
+    rf.me, minMatchLogIndex, len(rf.logs), rf.commitIndex)
 
 	if minMatchLogIndex > rf.commitIndex {
 		minMatch := rf.getArrayIndex(minMatchLogIndex)
@@ -708,27 +766,21 @@ func (rf *Raft) heartbeats() {
 
 // Caller must hold the mutex
 func (rf *Raft) makeAppendEntriesArgs(peer int) AppendEntriesArgs {
-	PrintDebug(
-    "Start to MakeAppendEntriesArgs server: %v -> %v",
-    rf.me, peer)
-
 	args := AppendEntriesArgs{}
 	args.Term = rf.currentTerm
 	args.LeaderId = rf.me
 
 	nextLogId := rf.nextIndex[peer]
-	// TODO: Install snapshot if previous logs are deleted.
-	args.PrevLogIndex = nextLogId - 1
 
-  if args.PrevLogIndex == rf.startIndex - 1 {
+  if nextLogId <= rf.startIndex {
+	// TODO: Install snapshot if previous logs are deleted.
+    args.PrevLogIndex = rf.lastIncludedIndex
     args.PrevLogTerm = rf.lastIncludedTerm
-  } else if args.PrevLogIndex > rf.startIndex {
+  } else {
+    args.PrevLogIndex = nextLogId - 1
     prevIndex := rf.getArrayIndex(args.PrevLogIndex)
     args.PrevLogTerm = rf.logs[prevIndex].Term
   }
-	PrintDebug(
-    "MakeAppendEntriesArgs server: %v -> %v: preLogIndex: %v, prevLogTerm: %v",
-    rf.me, peer, args.PrevLogIndex, args.PrevLogTerm)
 
 	args.Entries = []Log{}
 	nextId := rf.getArrayIndex(nextLogId)
@@ -737,9 +789,13 @@ func (rf *Raft) makeAppendEntriesArgs(peer int) AppendEntriesArgs {
 	}
 
 	args.LeaderCommit = rf.commitIndex
+
 	PrintDebug(
-    "MakeAppendEntriesArgs server: %v -> %v: nextId: %v, entries: %v, commit: %v",
-    rf.me, peer, nextId, args.Entries, args.LeaderCommit)
+    "MakeAppendEntriesArgs server: %v -> %v:\n             " +
+    "nextLogId: %v, preLogIndex: %v, prevLogTerm: %v " +
+    "entries size: %v, commit: %v",
+    rf.me, peer, nextLogId, args.PrevLogIndex,
+    args.PrevLogTerm, len(args.Entries), args.LeaderCommit)
 
 	return args
 }
@@ -775,7 +831,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.persist()
 
-	PrintDebug("%v Start command: [term: %v, logs: %v]", rf.me, newLog.Term, rf.logs)
+	PrintDebugRed(
+    "%v Start command: [term: %v, total logs size: %v]",
+    rf.me, newLog.Term, rf.getLastLogIndex())
 	go rf.sendUpdates()
 
 	return /*index=*/ rf.getLogIndex(len(rf.logs) - 1),
@@ -885,6 +943,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+  rf.snapshot = clone(persister.ReadSnapshot())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
