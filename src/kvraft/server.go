@@ -4,20 +4,24 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
+  "fmt"
+  // "log"
 	"sync"
 	"sync/atomic"
+  "time"
 )
 
 const Debug = false
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
+func PrintDebug(format string, a ...interface{}) {
+	if !Debug {
+		return
 	}
-	return
+	curr := time.Now().Format("15:04:05.000")
+	fmt.Printf("%s %s\n", curr, fmt.Sprintf(format, a...))
 }
 
+const opTimeout = 100 // milliseconds
 
 type Op struct {
 	// Your definitions here.
@@ -35,15 +39,69 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+  data     map[string]string
 }
 
+// Caller must hold the mutex.
+func (kv *KVServer) startOp(op *Op) Err {
+  _, _, isLeader := kv.rf.Start(op)
+  if !isLeader {
+    return ErrWrongLeader
+  }
+
+  select {
+    case <-kv.applyCh:
+      return OK
+    case <-time.After(opTimeout * time.Millisecond):
+      return ErrTimeout
+  }
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+  op := Op{}
+
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  status := kv.startOp(&op)
+  if status != OK {
+    reply.Err = status
+    return
+  }
+
+  value, exists := kv.data[args.Key]
+  if !exists {
+    reply.Value = ""
+    reply.Err = ErrNoKey
+    return
+  }
+
+  reply.Value = value
+  reply.Err = OK
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+  op := Op{}
+
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  status := kv.startOp(&op)
+  if status != OK {
+    reply.Err = status
+    return
+  }
+
+  if args.Op == "Put" {
+    kv.data[args.Key] = args.Value
+  } else if args.Op == "Append" {
+    oldValue, _ := kv.data[args.Key]
+    kv.data[args.Key] = oldValue + args.Value
+  }
+
+  reply.Err = OK
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -77,7 +135,12 @@ func (kv *KVServer) killed() bool {
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
-func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
+func StartKVServer(
+  servers []*labrpc.ClientEnd,
+  me int,
+  persister *raft.Persister,
+  maxraftstate int,
+) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
@@ -92,6 +155,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+  kv.data = make(map[string]string)
 
 	return kv
 }
