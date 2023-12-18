@@ -965,7 +965,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	if rf.state != Leader {
-		return index, term /*isLeader=*/, false
+		return index, term, /*isLeader=*/false
 	}
 
 	newLog := Log{}
