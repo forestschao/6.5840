@@ -14,6 +14,8 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
   leaderId int // Index of the KVServer leader
+  me       int64
+  cmdId    int // Command index
 }
 
 func nrand() int64 {
@@ -27,6 +29,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+  ck.me = nrand() % 1000
+  ck.leaderId = int(nrand() % int64(len(servers)))
 	return ck
 }
 
@@ -35,6 +39,10 @@ func (ck *Clerk) updateLeader () {
   if ck.leaderId >= len(ck.servers) {
     ck.leaderId = 0
   }
+}
+func (ck *Clerk) getCmdId() string {
+  ck.cmdId++
+  return fmt.Sprintf("%v_%v", ck.me, ck.cmdId)
 }
 
 // fetch the current value for a key.
@@ -50,17 +58,23 @@ func (ck *Clerk) updateLeader () {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
   args := GetArgs {
+    CmdId: ck.getCmdId(),
     Key: key,
   }
   reply := GetReply{}
 
   rpc := fmt.Sprintf("KVServer.%s", RpcGet)
   for {
+    PrintDebug(
+      "%v: Get leader:%v, %v: {%v}", ck.me, ck.leaderId, args.CmdId, key)
     ok := ck.servers[ck.leaderId].Call(rpc, &args, &reply)
-    if ok && reply.Err != ErrWrongLeader {
+    if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
       break
     }
 
+    PrintDebug(
+      "%v: Get leader:%v, %v: error {%v}",
+      ck.me, ck.leaderId, args.CmdId, reply.Err)
     ck.updateLeader()
   }
 
@@ -83,6 +97,7 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
   args := PutAppendArgs {
+    CmdId: ck.getCmdId(),
     Key: key,
     Value: value,
     Op: op,
@@ -91,11 +106,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
   rpc := fmt.Sprintf("KVServer.%s", RpcPutAppend)
   for {
+    PrintDebug("%v: %v leader: %v, %v: %v -> {%v}",
+      ck.me, op, ck.leaderId, args.CmdId, args.Key, args.Value)
     ok := ck.servers[ck.leaderId].Call(rpc, &args, &reply)
-    if ok && reply.Err != ErrWrongLeader {
+    if ok && reply.Err == OK {
       break
     }
 
+    PrintDebug("%v: %v result: %v", ck.me, op, reply.Err)
     ck.updateLeader()
   }
 

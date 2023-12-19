@@ -11,22 +11,45 @@ import (
   "time"
 )
 
-const Debug = false
+const DebugMode = false
 
 func PrintDebug(format string, a ...interface{}) {
-	if !Debug {
+	if !DebugMode {
 		return
 	}
 	curr := time.Now().Format("15:04:05.000")
 	fmt.Printf("%s %s\n", curr, fmt.Sprintf(format, a...))
 }
 
-const opTimeout = 100 // milliseconds
+func PrintDebugGreen(format string, a ...interface{}) {
+	if !DebugMode {
+		return
+	}
+	curr := time.Now().Format("15:04:05.000")
+	fmt.Printf("\033[32m%s %s\033[0m\n", curr, fmt.Sprintf(format, a...))
+}
+
+func PrintDebugYellow(format string, a ...interface{}) {
+	if !DebugMode {
+		return
+	}
+	curr := time.Now().Format("15:04:05.000")
+	fmt.Printf("\033[33m%s %s\033[0m\n", curr, fmt.Sprintf(format, a...))
+}
+
+const (
+  OpGet = "Get"
+  OpPutAppend = "PutAppend"
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+  Type         string
+  CmdId        string
+  GetArg       GetArgs
+  PutAppendArg PutAppendArgs
 }
 
 type KVServer struct {
@@ -40,68 +63,172 @@ type KVServer struct {
 
 	// Your definitions here.
   data     map[string]string
+  history  map[string]bool
+  handlers map[int]*chan raft.ApplyMsg
+}
+
+func (kv *KVServer) updateState() {
+  for msg := range kv.applyCh {
+    op, ok := msg.Command.(Op)
+    if !ok {
+      PrintDebug("Cannot instantiate the command")
+      continue
+    }
+
+    PrintDebugGreen("%v: Receive     %v, index: %v",
+      kv.me, op.CmdId, msg.CommandIndex)
+    kv.processOp(op)
+
+    kv.mu.Lock()
+    handler, exists := kv.handlers[msg.CommandIndex]
+    kv.mu.Unlock()
+
+    if exists {
+      *handler <- msg
+    }
+    PrintDebugGreen("%v: UpdateState %v Done", kv.me, op.CmdId)
+  }
+}
+
+func (kv *KVServer) processOp(op Op) {
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  kv.history[op.CmdId] = true
+
+  if op.Type == OpPutAppend {
+    kv.processPutAppend(&op.PutAppendArg)
+  }
 }
 
 // Caller must hold the mutex.
-func (kv *KVServer) startOp(op *Op) Err {
-  _, _, isLeader := kv.rf.Start(op)
-  if !isLeader {
-    return ErrWrongLeader
-  }
-
-  select {
-    case <-kv.applyCh:
-      return OK
-    case <-time.After(opTimeout * time.Millisecond):
-      return ErrTimeout
-  }
-}
-
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-  op := Op{}
-
-  kv.mu.Lock()
-  defer kv.mu.Unlock()
-
-  status := kv.startOp(&op)
-  if status != OK {
-    reply.Err = status
-    return
-  }
-
-  value, exists := kv.data[args.Key]
-  if !exists {
-    reply.Value = ""
-    reply.Err = ErrNoKey
-    return
-  }
-
-  reply.Value = value
-  reply.Err = OK
-}
-
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-  op := Op{}
-
-  kv.mu.Lock()
-  defer kv.mu.Unlock()
-
-  status := kv.startOp(&op)
-  if status != OK {
-    reply.Err = status
-    return
-  }
-
+func (kv *KVServer) processPutAppend(args *PutAppendArgs) {
   if args.Op == "Put" {
     kv.data[args.Key] = args.Value
   } else if args.Op == "Append" {
     oldValue, _ := kv.data[args.Key]
     kv.data[args.Key] = oldValue + args.Value
   }
+}
 
+// Caller mustn't hold the mutex.
+func (kv *KVServer) isCommitted(cmdId string) bool {
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  _, exists := kv.history[cmdId]
+  return exists
+}
+
+func (kv *KVServer) setHandler(index int, handler *chan raft.ApplyMsg) {
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  oldHandler, exists := kv.handlers[index]
+  if exists {
+    close(*oldHandler)
+  }
+
+  kv.handlers[index] = handler
+}
+
+func (kv *KVServer) deleteHandler(index int) {
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  PrintDebugYellow(
+    "%v: start to delete handler: %v", kv.me, index)
+  oldHandler, exists := kv.handlers[index]
+  if exists {
+    close(*oldHandler)
+  }
+
+  delete(kv.handlers, index)
+}
+
+func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	// Your code here.
   reply.Err = OK
+  if !kv.isCommitted(args.CmdId) {
+    op := Op {
+      Type:   OpGet,
+      CmdId:  args.CmdId,
+      GetArg: *args,
+    }
+    index, _, isLeader := kv.rf.Start(op)
+    if !isLeader {
+      reply.Err = ErrWrongLeader
+      return 
+    }
+
+    reply.Err = kv.waitForRaft(index, op.CmdId)
+  }
+
+  if reply.Err != OK {
+    return
+  }
+
+  PrintDebugGreen("%v: %s %v: {%v}", kv.me, "Get", args.CmdId, args.Key)
+
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  value, exists := kv.data[args.Key]
+  reply.Value = value
+  if !exists {
+    reply.Err = ErrNoKey
+  } else {
+    reply.Err = OK
+  }
+}
+
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Your code here.
+  if kv.isCommitted(args.CmdId) {
+    reply.Err = OK
+    return
+  }
+
+  op := Op {
+    Type:         OpPutAppend,
+    CmdId:        args.CmdId,
+    PutAppendArg: *args,
+  }
+
+  index, _, isLeader := kv.rf.Start(op)
+  if !isLeader {
+    reply.Err = ErrWrongLeader
+    return 
+  }
+
+  PrintDebugGreen("%v: %s %v: %v -> {%v}",
+    kv.me, args.Op, args.CmdId, args.Key, args.Value)
+
+  reply.Err = kv.waitForRaft(index, op.CmdId)
+}
+
+func (kv *KVServer) waitForRaft(index int, cmdId string) Err {
+  wait := make(chan raft.ApplyMsg)
+
+  kv.setHandler(index, &wait)
+  defer kv.deleteHandler(index)
+
+  PrintDebugYellow("%v: wait for raft %v, index: %v", kv.me, cmdId, index)
+
+  var resultMsg raft.ApplyMsg
+
+  resultMsg = <-wait
+
+  resultOp, ok := resultMsg.Command.(Op)
+  if !ok {
+    return ErrParse
+  }
+
+  if resultOp.CmdId != cmdId {
+    return ErrLoseLeader
+  } else {
+    return OK
+  }
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -156,6 +283,10 @@ func StartKVServer(
 
 	// You may need initialization code here.
   kv.data = make(map[string]string)
+  kv.history = make(map[string]bool)
+  kv.handlers = make(map[int]*chan raft.ApplyMsg)
+
+  go kv.updateState()
 
 	return kv
 }
