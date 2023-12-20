@@ -42,10 +42,13 @@ const (
   OpPutAppend = "PutAppend"
 )
 
+const opTimeout = 100 // Milliseconds
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+  From         int
   Type         string
   CmdId        string
   GetArg       GetArgs
@@ -75,8 +78,8 @@ func (kv *KVServer) updateState() {
       continue
     }
 
-    PrintDebugGreen("%v: Receive     %v, index: %v",
-      kv.me, op.CmdId, msg.CommandIndex)
+    PrintDebugGreen("%v: Receive     %v from: %v, index: %v",
+      kv.me, op.CmdId, op.From, msg.CommandIndex)
     kv.processOp(op)
 
     kv.mu.Lock()
@@ -93,6 +96,11 @@ func (kv *KVServer) updateState() {
 func (kv *KVServer) processOp(op Op) {
   kv.mu.Lock()
   defer kv.mu.Unlock()
+
+  _, exists := kv.history[op.CmdId]
+  if exists {
+    return
+  }
 
   kv.history[op.CmdId] = true
 
@@ -151,6 +159,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
   reply.Err = OK
   if !kv.isCommitted(args.CmdId) {
     op := Op {
+      From:         kv.me,
       Type:   OpGet,
       CmdId:  args.CmdId,
       GetArg: *args,
@@ -190,6 +199,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
   }
 
   op := Op {
+    From:         kv.me,
     Type:         OpPutAppend,
     CmdId:        args.CmdId,
     PutAppendArg: *args,
@@ -217,7 +227,11 @@ func (kv *KVServer) waitForRaft(index int, cmdId string) Err {
 
   var resultMsg raft.ApplyMsg
 
-  resultMsg = <-wait
+  select {
+  case <-time.After(opTimeout * time.Millisecond):
+    return ErrTimeout
+  case resultMsg = <-wait:
+  }
 
   resultOp, ok := resultMsg.Command.(Op)
   if !ok {
