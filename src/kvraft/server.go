@@ -132,6 +132,7 @@ func (kv *KVServer) executeCmd(msg raft.ApplyMsg) {
     kv.me, op.CmdId, op.From, msg.CommandIndex)
 
   kv.mu.Lock()
+  defer kv.mu.Unlock()
 
   kv.processOp(op)
 
@@ -140,8 +141,6 @@ func (kv *KVServer) executeCmd(msg raft.ApplyMsg) {
   }
 
   handler, exists := kv.handlers[msg.CommandIndex]
-
-  kv.mu.Unlock()
 
   if exists {
     *handler <- msg
