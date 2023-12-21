@@ -4,7 +4,10 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+  "bytes"
+  "compress/gzip"
   "fmt"
+  "io/ioutil"
   // "log"
 	"sync"
 	"sync/atomic"
@@ -50,7 +53,7 @@ type Op struct {
 	// otherwise RPC will break.
   From         int
   Type         string
-  CmdId        string
+  CmdId        int64
   GetArg       GetArgs
   PutAppendArg PutAppendArgs
 }
@@ -66,37 +69,109 @@ type KVServer struct {
 
 	// Your definitions here.
   data     map[string]string
-  history  map[string]bool
+  history  map[int64]bool
   handlers map[int]*chan raft.ApplyMsg
+
+  persister *raft.Persister
 }
 
 func (kv *KVServer) updateState() {
   for msg := range kv.applyCh {
-    op, ok := msg.Command.(Op)
-    if !ok {
-      PrintDebug("Cannot instantiate the command")
-      continue
+    if msg.SnapshotValid {
+      kv.ingestSnap(msg.Snapshot)
+    } else if msg.CommandValid {
+      kv.executeCmd(msg)
     }
-
-    PrintDebugGreen("%v: Receive     %v from: %v, index: %v",
-      kv.me, op.CmdId, op.From, msg.CommandIndex)
-    kv.processOp(op)
-
-    kv.mu.Lock()
-    handler, exists := kv.handlers[msg.CommandIndex]
-    kv.mu.Unlock()
-
-    if exists {
-      *handler <- msg
-    }
-    PrintDebugGreen("%v: UpdateState %v Done", kv.me, op.CmdId)
   }
 }
 
-func (kv *KVServer) processOp(op Op) {
+func (kv *KVServer) ingestSnap(snapshot []byte) {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
+  // Decompress
+  compressedBuffer := bytes.NewReader(snapshot)
+  gzipReader, err := gzip.NewReader(compressedBuffer)
+  if err != nil {
+    PrintDebug("Error creating gzip rader: %s", err)
+    return
+  }
+  defer gzipReader.Close()
+
+  data, err := ioutil.ReadAll(gzipReader)
+  if err != nil {
+    PrintDebug("Error reading decompressed data: %s", err)
+    return
+  }
+
+  r := bytes.NewBuffer(data)
+  d := labgob.NewDecoder(r)
+
+  if d.Decode(&kv.data) != nil ||
+    d.Decode(&kv.history) != nil {
+    PrintDebug("Snapshot decode error")
+    return
+  }
+
+  for index, handler := range kv.handlers {
+    close(*handler)
+    delete(kv.handlers, index)
+  }
+}
+
+func (kv *KVServer) executeCmd(msg raft.ApplyMsg) {
+  op, ok := msg.Command.(Op)
+  if !ok {
+    PrintDebug("Cannot instantiate the command")
+    return
+  }
+
+  PrintDebugGreen("%v: Receive     %v from: %v, index: %v",
+    kv.me, op.CmdId, op.From, msg.CommandIndex)
+
+  kv.mu.Lock()
+
+  kv.processOp(op)
+
+  if kv.needSnapshot() {
+    kv.sendSnapshot(msg.CommandIndex)
+  }
+
+  handler, exists := kv.handlers[msg.CommandIndex]
+
+  kv.mu.Unlock()
+
+  if exists {
+    *handler <- msg
+  }
+  PrintDebugGreen("%v: UpdateState %v Done", kv.me, op.CmdId)
+}
+
+func (kv *KVServer) needSnapshot() bool {
+  return kv.maxraftstate > 0 && 
+    kv.persister.RaftStateSize() > kv.maxraftstate - 100
+}
+
+func (kv *KVServer) sendSnapshot(index int) {
+  w := new(bytes.Buffer)
+  e := labgob.NewEncoder(w)
+  e.Encode(kv.data)
+  e.Encode(kv.history)
+
+  // Comress
+  var compressedData bytes.Buffer
+  gz := gzip.NewWriter(&compressedData)
+  _, err := gz.Write(w.Bytes())
+  if err != nil {
+    PrintDebug("Error compressing: %s", err)
+    return
+  }
+  gz.Close()
+
+  kv.rf.Snapshot(index, compressedData.Bytes())
+}
+
+func (kv *KVServer) processOp(op Op) {
   _, exists := kv.history[op.CmdId]
   if exists {
     return
@@ -120,7 +195,7 @@ func (kv *KVServer) processPutAppend(args *PutAppendArgs) {
 }
 
 // Caller mustn't hold the mutex.
-func (kv *KVServer) isCommitted(cmdId string) bool {
+func (kv *KVServer) isCommitted(cmdId int64) bool {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
@@ -217,7 +292,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
   reply.Err = kv.waitForRaft(index, op.CmdId)
 }
 
-func (kv *KVServer) waitForRaft(index int, cmdId string) Err {
+func (kv *KVServer) waitForRaft(index int, cmdId int64) Err {
   wait := make(chan raft.ApplyMsg)
 
   kv.setHandler(index, &wait)
@@ -297,8 +372,14 @@ func StartKVServer(
 
 	// You may need initialization code here.
   kv.data = make(map[string]string)
-  kv.history = make(map[string]bool)
+  kv.history = make(map[int64]bool)
   kv.handlers = make(map[int]*chan raft.ApplyMsg)
+
+  kv.persister = persister
+  snapshot := persister.ReadSnapshot()
+  if snapshot != nil && len(snapshot) > 0 {
+    kv.ingestSnap(snapshot)
+  }
 
   go kv.updateState()
 

@@ -29,7 +29,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-  ck.me = nrand() % 1000
+  ck.me = nrand() % 1000000000
   ck.leaderId = int(nrand() % int64(len(servers)))
 	return ck
 }
@@ -40,9 +40,10 @@ func (ck *Clerk) updateLeader () {
     ck.leaderId = 0
   }
 }
-func (ck *Clerk) getCmdId() string {
-  ck.cmdId++
-  return fmt.Sprintf("%v_%v", ck.me, ck.cmdId)
+func (ck *Clerk) getCmdId() int64 {
+  return nrand()
+  // ck.cmdId++
+  // return fmt.Sprintf("%v_%v", ck.me, ck.cmdId)
 }
 
 // fetch the current value for a key.
