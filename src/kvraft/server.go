@@ -53,6 +53,7 @@ type Op struct {
 	// otherwise RPC will break.
   From         int
   Type         string
+  ClerkId      int64
   CmdId        int64
   GetArg       GetArgs
   PutAppendArg PutAppendArgs
@@ -69,7 +70,7 @@ type KVServer struct {
 
 	// Your definitions here.
   data     map[string]string
-  history  map[int64]bool
+  history  map[int64]int64
   handlers map[int]*chan raft.ApplyMsg
 
   persister *raft.Persister
@@ -98,13 +99,14 @@ func (kv *KVServer) ingestSnap(snapshot []byte) {
   }
   defer gzipReader.Close()
 
-  data, err := ioutil.ReadAll(gzipReader)
+  decompressedData, err := ioutil.ReadAll(gzipReader)
   if err != nil {
     PrintDebug("Error reading decompressed data: %s", err)
     return
   }
 
-  r := bytes.NewBuffer(data)
+  // Decode
+  r := bytes.NewBuffer(decompressedData)
   d := labgob.NewDecoder(r)
 
   if d.Decode(&kv.data) != nil ||
@@ -153,12 +155,13 @@ func (kv *KVServer) needSnapshot() bool {
 }
 
 func (kv *KVServer) sendSnapshot(index int) {
+  // Encode
   w := new(bytes.Buffer)
   e := labgob.NewEncoder(w)
   e.Encode(kv.data)
   e.Encode(kv.history)
 
-  // Comress
+  // Compress
   var compressedData bytes.Buffer
   gz := gzip.NewWriter(&compressedData)
   _, err := gz.Write(w.Bytes())
@@ -172,12 +175,12 @@ func (kv *KVServer) sendSnapshot(index int) {
 }
 
 func (kv *KVServer) processOp(op Op) {
-  _, exists := kv.history[op.CmdId]
-  if exists {
+  prevCmdId, _ := kv.history[op.ClerkId]
+  if prevCmdId >= op.CmdId {
     return
   }
 
-  kv.history[op.CmdId] = true
+  kv.history[op.ClerkId] = op.CmdId
 
   if op.Type == OpPutAppend {
     kv.processPutAppend(&op.PutAppendArg)
@@ -195,12 +198,13 @@ func (kv *KVServer) processPutAppend(args *PutAppendArgs) {
 }
 
 // Caller mustn't hold the mutex.
-func (kv *KVServer) isCommitted(cmdId int64) bool {
+func (kv *KVServer) isCommitted(clerkId int64, cmdId int64) bool {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
-  _, exists := kv.history[cmdId]
-  return exists
+
+  prevCmdId, _ := kv.history[clerkId]
+  return prevCmdId >= cmdId
 }
 
 func (kv *KVServer) setHandler(index int, handler *chan raft.ApplyMsg) {
@@ -232,12 +236,13 @@ func (kv *KVServer) deleteHandler(index int) {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
   reply.Err = OK
-  if !kv.isCommitted(args.CmdId) {
+  if !kv.isCommitted(args.ClerkId, args.CmdId) {
     op := Op {
-      From:         kv.me,
-      Type:   OpGet,
-      CmdId:  args.CmdId,
-      GetArg: *args,
+      From:    kv.me,
+      Type:    OpGet,
+      ClerkId: args.ClerkId,
+      CmdId:   args.CmdId,
+      GetArg:  *args,
     }
     index, _, isLeader := kv.rf.Start(op)
     if !isLeader {
@@ -268,7 +273,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-  if kv.isCommitted(args.CmdId) {
+  if kv.isCommitted(args.ClerkId, args.CmdId) {
     reply.Err = OK
     return
   }
@@ -276,6 +281,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
   op := Op {
     From:         kv.me,
     Type:         OpPutAppend,
+    ClerkId:      args.ClerkId,
     CmdId:        args.CmdId,
     PutAppendArg: *args,
   }
@@ -372,7 +378,7 @@ func StartKVServer(
 
 	// You may need initialization code here.
   kv.data = make(map[string]string)
-  kv.history = make(map[int64]bool)
+  kv.history = make(map[int64]int64)
   kv.handlers = make(map[int]*chan raft.ApplyMsg)
 
   kv.persister = persister

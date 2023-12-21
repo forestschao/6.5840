@@ -15,7 +15,7 @@ type Clerk struct {
 	// You will have to modify this struct.
   leaderId int // Index of the KVServer leader
   me       int64
-  cmdId    int // Command index
+  cmdId    int64 // Command index
 }
 
 func nrand() int64 {
@@ -29,7 +29,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-  ck.me = nrand() % 1000000000
+  ck.me = nrand()
   ck.leaderId = int(nrand() % int64(len(servers)))
 	return ck
 }
@@ -41,9 +41,8 @@ func (ck *Clerk) updateLeader () {
   }
 }
 func (ck *Clerk) getCmdId() int64 {
-  return nrand()
-  // ck.cmdId++
-  // return fmt.Sprintf("%v_%v", ck.me, ck.cmdId)
+  ck.cmdId++
+  return ck.cmdId
 }
 
 // fetch the current value for a key.
@@ -59,6 +58,7 @@ func (ck *Clerk) getCmdId() int64 {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
   args := GetArgs {
+    ClerkId: ck.me,
     CmdId: ck.getCmdId(),
     Key: key,
   }
@@ -98,6 +98,7 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
   args := PutAppendArgs {
+    ClerkId: ck.me,
     CmdId: ck.getCmdId(),
     Key: key,
     Value: value,
