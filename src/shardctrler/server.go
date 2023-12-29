@@ -169,8 +169,19 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
   PrintDebugGreen("%v: %s %v", sc.me, OpQuery, args.Num)
 
+  reply.Config = sc.getConfig(args)
+}
+
+// Caller should not hold mutex.
+func (sc *ShardCtrler) getConfig(args *QueryArgs) Config {
   sc.mu.Lock()
   defer sc.mu.Unlock()
+
+  configNum := args.Num
+  if configNum  == -1 || configNum > sc.cmdNum {
+    configNum = sc.cmdNum
+  }
+  return sc.configs[configNum]
 }
 
 func (sc *ShardCtrler) receiveCmd() {
@@ -316,7 +327,8 @@ func StartServer(
 
 	// Your code here.
   sc.cmdNum = 0
-  // TODO: Add initial config.
+  config := Config{}
+  sc.configs = append(sc.configs, config)
 
   go sc.receiveCmd()
 
