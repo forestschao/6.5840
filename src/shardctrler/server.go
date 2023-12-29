@@ -228,34 +228,42 @@ func (sc *ShardCtrler) processOp(op Op) {
 }
 
 // Caller must hold the mutex.
-func (sc *ShardCtrler) getCmdNum() int {
-  sc.cmdNum++
-  return sc.cmdNum
-}
-
-// Caller must hold the mutex.
 func (sc *ShardCtrler) processJoin(args *JoinArgs) {
-  prev_config := sc.configs[sc.cmdNum]
-  config := Config {
-    Num: sc.getCmdNum(),
-  }
-
-  for gid, servers := range prev_config.Groups {
-    config.Groups[gid] = make([]string, len(servers))
-    copy(config.Groups[gid], servers)
-  }
-  for gid, servers := range args.Servers {
-    config.Groups[gid] = make([]string, len(servers))
-    copy(config.Groups[gid], servers)
-  }
-
-  sc.configs = append(sc.configs, config)
 }
 
 func (sc *ShardCtrler) processLeave(args *LeaveArgs) {
 }
 
 func (sc *ShardCtrler) processMove(args *MoveArgs) {
+  sc.mu.Lock()
+  defer sc.mu.Unlock()
+
+  config := sc.addConfig()
+  config.Shards[args.Shard] = args.GID
+}
+
+// Caller must hold the mutex.
+// Duplicate the latest config into configs.
+func (sc *ShardCtrler) addConfig() Config {
+  latestConfig := sc.configs[sc.cmdNum]
+
+  sc.cmdNum++
+  config := Config {
+    Num: sc.cmdNum,
+  }
+
+  for i := 0; i < len(config.Shards); i++ {
+    config.Shards[i] = latestConfig.Shards[i]
+  }
+
+  for gid, servers := range latestConfig.Groups {
+    config.Groups[gid] = make([]string, len(servers))
+    copy(config.Groups[gid], servers)
+  }
+
+  sc.configs = append(sc.configs, config)
+
+  return config
 }
 
 func (sc *ShardCtrler) isCommitted(clerkId int64, cmdId int64) bool {
