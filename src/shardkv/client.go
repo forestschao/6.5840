@@ -38,6 +38,8 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+  me       int64
+  cmdId    int64
 }
 
 // the tester calls MakeClerk.
@@ -47,12 +49,21 @@ type Clerk struct {
 // make_end(servername) turns a server name from a
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
-func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
+func MakeClerk(
+  ctrlers []*labrpc.ClientEnd,
+  make_end func(string) *labrpc.ClientEnd,
+) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+  ck.me = nrand()
 	return ck
+}
+
+func (ck *Clerk) getCmdId() int64 {
+  ck.cmdId++
+  return ck.cmdId
 }
 
 // fetch the current value for a key.
@@ -60,8 +71,11 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	args := GetArgs{
+    ClerkId: ck.me,
+    CmdId:   ck.getCmdId(),
+    Key:     key,
+  }
 
 	for {
 		shard := key2shard(key)
@@ -92,11 +106,13 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
+	args := PutAppendArgs{
+    ClerkId: ck.me,
+    CmdId: ck.getCmdId(),
+    Key: key,
+    Value: value,
+    Op: op,
+  }
 
 	for {
 		shard := key2shard(key)

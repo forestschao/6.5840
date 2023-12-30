@@ -4,6 +4,7 @@ package shardkv
 import "6.5840/labgob"
 import "6.5840/labrpc"
 import "6.5840/raft"
+import "6.5840/shardctrler"
 import "bytes"
 import "compress/gzip"
 import "fmt"
@@ -11,7 +12,7 @@ import "io/ioutil"
 import "sync"
 import "time"
 
-const DebugMode = true
+const DebugMode = false
 
 func PrintDebug(format string, a ...interface{}) {
   PrintDebugInternal("\033[0m", format, a...)
@@ -74,6 +75,9 @@ type ShardKV struct {
   handlers map[int]*chan raft.ApplyMsg // Log index -> handler
 
   persister *raft.Persister
+
+  sm       *shardctrler.Clerk
+  config   shardctrler.Config
 }
 
 func (kv *ShardKV) receiveMsg() {
@@ -398,6 +402,8 @@ func StartServer(
   if snapshot != nil && len(snapshot) > 0 {
     kv.ingestSnap(snapshot)
   }
+
+  kv.sm = shardctrler.MakeClerk(ctrlers)
 
   go kv.receiveMsg()
 
