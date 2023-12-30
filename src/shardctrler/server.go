@@ -10,7 +10,7 @@ import "time"
 import "sort"
 
 
-const DebugMode = true
+const DebugMode = false
 
 func PrintDebug(format string, a ...interface{}) {
 	if !DebugMode {
@@ -265,6 +265,38 @@ func (sc *ShardCtrler) processJoin(args *JoinArgs) {
 }
 
 func (sc *ShardCtrler) processLeave(args *LeaveArgs) {
+  PrintDebugGreen(
+    "Process Leave: clerk: %v, cmd: %v, GIDs: %v",
+    args.ClerkId, args.CmdId, args.GIDs)
+
+  sc.addConfig()
+  config := &sc.configs[len(sc.configs) - 1]
+  sc.removeGIDs(args.GIDs, config)
+
+  if len(config.Groups) > 0 {
+    groupShards, groupOrder := sc.getGroupShard(config)
+    groupShards[0] = GroupShard{}
+
+    sc.rebalance(groupShards, groupOrder, config)
+  }
+}
+
+func (sc *ShardCtrler) removeGIDs(gids []int, config *Config) {
+  for _, gid := range gids {
+    delete(config.Groups, gid)
+  }
+
+  gidMap := map[int]bool{}
+  for _, gid := range gids {
+    gidMap[gid] = true
+  }
+
+  for index, gid := range config.Shards {
+    _, isExisted := gidMap[gid]
+    if isExisted {
+      config.Shards[index] = 0
+    }
+  }
 }
 
 func (sc *ShardCtrler) getGroupShard(
@@ -380,11 +412,8 @@ func (sc *ShardCtrler) createTargetSlice(groupSize int) []int {
 }
 
 func (sc *ShardCtrler) processMove(args *MoveArgs) {
-  sc.mu.Lock()
-  defer sc.mu.Unlock()
-
   sc.addConfig()
-  config := sc.configs[len(sc.configs) - 1]
+  config := &sc.configs[len(sc.configs) - 1]
   config.Shards[args.Shard] = args.GID
 }
 
