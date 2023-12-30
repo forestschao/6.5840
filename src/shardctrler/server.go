@@ -190,9 +190,6 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
   PrintDebugGreen("%v: %s %v", sc.me, OpQuery, args.Num)
 
   reply.Config = sc.getConfig(args)
-  for gid, servers := range reply.Config.Groups {
-    PrintDebug("Query: gid: %v servers: %v", gid, servers)
-  }
 }
 
 // Caller should not hold mutex.
@@ -303,24 +300,12 @@ func (sc *ShardCtrler) getGroupShard(
   config *Config,
 ) (map[int]GroupShard, []GroupShard) {
   targets := sc.createTargetSlice(len(config.Groups))
-  for id, value := range targets {
-    PrintDebug(
-      "target: index: %v, value: %v", id, value)
-  }
-
   groupShards, groupOrder := sc.createGroupShard(config)
-  for id, g := range groupOrder {
-    PrintDebug(
-      "order: index: %v, gid: %v, has: %v",
-      id, g.gid, g.has)
-  }
 
   for id, groupShard := range groupOrder {
     g := groupShards[groupShard.gid]
     g.need = targets[id]
     groupShards[groupShard.gid] = g
-    PrintDebug(
-      "groupShards: gid: %v, need: %v", groupShard.gid, g.need)
   }
 
   return groupShards, groupOrder
@@ -340,8 +325,6 @@ func (sc *ShardCtrler) rebalance(
     } else {
       to := groupOrder[smallestId].gid
       for groupShards[to].need <= 0 {
-        PrintDebugGreen(
-          "rebalance: to: %v, need: %v", to, groupShards[to].need)
         smallestId++
         to = groupOrder[smallestId].gid
       }
@@ -445,9 +428,6 @@ func (sc *ShardCtrler) isCommitted(clerkId int64, cmdId int64) bool {
 
   prevCmdId, _ := sc.history[clerkId]
 
-  if prevCmdId >= cmdId {
-    PrintDebug("cmd: clerkId: %v, cmdId: %v is committed", clerkId, cmdId)
-  }
   return prevCmdId >= cmdId
 }
 
