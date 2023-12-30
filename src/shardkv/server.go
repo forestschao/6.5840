@@ -5,7 +5,36 @@ import "6.5840/labrpc"
 import "6.5840/raft"
 import "sync"
 import "6.5840/labgob"
+import "fmt"
+import "time"
 
+const DebugMode = true
+
+func PrintDebug(format string, a ...interface{}) {
+  PrintDebugInternal("\033[0m", format, a...)
+}
+
+func PrintDebugRed(format string, a ...interface{}) {
+  PrintDebugInternal("\033[31m", format, a...)
+}
+
+func PrintDebugGreen(format string, a ...interface{}) {
+  PrintDebugInternal("\033[32m", format, a...)
+}
+
+func PrintDebugYellow(format string, a ...interface{}) {
+  PrintDebugInternal("\033[33m", format, a...)
+}
+
+func PrintDebugInternal(color string,format string, a ...interface{}) {
+	if !DebugMode {
+		return
+	}
+  reset := "\033[0m"
+	curr := time.Now().Format("15:04:05.000")
+	fmt.Printf("%s%s %s%s\n",
+    color, curr, fmt.Sprintf(format, a...), reset)
+}
 
 
 type Op struct {
