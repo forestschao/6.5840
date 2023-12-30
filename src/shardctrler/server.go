@@ -7,9 +7,10 @@ import "sync"
 import "6.5840/labgob"
 import "fmt"
 import "time"
+import "sort"
 
 
-const DebugMode = false
+const DebugMode = true
 
 func PrintDebug(format string, a ...interface{}) {
 	if !DebugMode {
@@ -35,6 +36,14 @@ func PrintDebugYellow(format string, a ...interface{}) {
 	fmt.Printf("\033[33m%s %s\033[0m\n", curr, fmt.Sprintf(format, a...))
 }
 
+func PrintDebugRed(format string, a ...interface{}) {
+	if !DebugMode {
+		return
+	}
+	curr := time.Now().Format("15:04:05.000")
+	fmt.Printf("\033[31m%s %s\033[0m\n", curr, fmt.Sprintf(format, a...))
+}
+
 const (
   OpJoin  = "Join"
   OpLeave = "Leave"
@@ -51,7 +60,6 @@ type ShardCtrler struct {
 	applyCh chan raft.ApplyMsg
 
 	// Your data here.
-  cmdNum   int                         // Starts with 0
 	configs  []Config                    // indexed by config num
   history  map[int64]int64             // Clerk Id -> Latest Cmd Id
   handlers map[int]*chan raft.ApplyMsg // Log index -> handler
@@ -69,15 +77,24 @@ type Op struct {
   QueryArgs QueryArgs
 }
 
+type GroupShard struct {
+  gid    int
+  has    int
+  need int
+}
+
+
 func (sc *ShardCtrler) commitOp(op *Op) Err {
   if sc.isCommitted(op.ClerkId, op.CmdId) {
     return OK
   }
 
-  index, term, isLeader := sc.rf.Start(op)
+  index, term, isLeader := sc.rf.Start(*op)
   if !isLeader {
     return ErrWrongLeader
   }
+  PrintDebug("commit op: type: %v, clerkId: %v, cmdId: %v",
+    op.Type, op.ClerkId, op.CmdId)
 
   return sc.waitForRaft(index, term)
 }
@@ -99,9 +116,12 @@ func (sc *ShardCtrler) waitForRaft(index int, term int) Err {
 
   currTerm, isLeader := sc.rf.GetState()
   if !isLeader || currTerm != term {
+    PrintDebugYellow("Lose leader.")
     return ErrLoseLeader
   }
 
+  PrintDebugYellow(
+    "%v: receive raft index: %v, term: %v", sc.me, index, term)
   return OK
 }
 
@@ -170,6 +190,9 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
   PrintDebugGreen("%v: %s %v", sc.me, OpQuery, args.Num)
 
   reply.Config = sc.getConfig(args)
+  for gid, servers := range reply.Config.Groups {
+    PrintDebug("Query: gid: %v servers: %v", gid, servers)
+  }
 }
 
 // Caller should not hold mutex.
@@ -178,8 +201,8 @@ func (sc *ShardCtrler) getConfig(args *QueryArgs) Config {
   defer sc.mu.Unlock()
 
   configNum := args.Num
-  if configNum  == -1 || configNum > sc.cmdNum {
-    configNum = sc.cmdNum
+  if configNum  == -1 || configNum >= len(sc.configs) {
+    configNum = len(sc.configs) - 1
   }
   return sc.configs[configNum]
 }
@@ -192,11 +215,7 @@ func (sc *ShardCtrler) receiveCmd() {
       return
     }
 
-    PrintDebugGreen("%v: Receive     %v index: %v",
-      sc.me, op.CmdId, msg.CommandIndex)
-
     sc.mu.Lock()
-    defer sc.mu.Unlock()
 
     sc.processOp(op)
 
@@ -205,7 +224,9 @@ func (sc *ShardCtrler) receiveCmd() {
     if exists {
       *handler <- msg
     }
-    PrintDebugGreen("%v: UpdateState %v Done", sc.me, op.CmdId)
+
+    sc.mu.Unlock()
+
   }
 }
 
@@ -227,29 +248,154 @@ func (sc *ShardCtrler) processOp(op Op) {
   }
 }
 
-// Caller must hold the mutex.
+// Caller should not hold the mutex.
 func (sc *ShardCtrler) processJoin(args *JoinArgs) {
+  PrintDebugGreen(
+    "Process Join: clerk: %v, cmd: %v", args.ClerkId, args.CmdId)
+
+  sc.addConfig()
+  config := &sc.configs[len(sc.configs) - 1]
+  for gid, servers := range args.Servers {
+    config.Groups[gid] = make([]string, len(servers))
+    copy(config.Groups[gid], servers)
+  }
+
+  groupShards, groupOrder := sc.getGroupShard(config)
+  sc.rebalance(groupShards, groupOrder, config)
 }
 
 func (sc *ShardCtrler) processLeave(args *LeaveArgs) {
+}
+
+func (sc *ShardCtrler) getGroupShard(
+  config *Config,
+) (map[int]GroupShard, []GroupShard) {
+  targets := sc.createTargetSlice(len(config.Groups))
+  for id, value := range targets {
+    PrintDebug(
+      "target: index: %v, value: %v", id, value)
+  }
+
+  groupShards, groupOrder := sc.createGroupShard(config)
+  for id, g := range groupOrder {
+    PrintDebug(
+      "order: index: %v, gid: %v, has: %v",
+      id, g.gid, g.has)
+  }
+
+  for id, groupShard := range groupOrder {
+    g := groupShards[groupShard.gid]
+    g.need = targets[id]
+    groupShards[groupShard.gid] = g
+    PrintDebug(
+      "groupShards: gid: %v, need: %v", groupShard.gid, g.need)
+  }
+
+  return groupShards, groupOrder
+}
+
+func (sc *ShardCtrler) rebalance(
+  groupShards map[int]GroupShard,
+  groupOrder  []GroupShard,
+  config      *Config,
+) {
+  smallestId := 0
+  for shardId, gid := range config.Shards {
+    fromGroup := groupShards[gid]
+    if fromGroup.need > 0 {
+      fromGroup.need--
+      groupShards[gid] = fromGroup
+    } else {
+      to := groupOrder[smallestId].gid
+      for groupShards[to].need <= 0 {
+        PrintDebugGreen(
+          "rebalance: to: %v, need: %v", to, groupShards[to].need)
+        smallestId++
+        to = groupOrder[smallestId].gid
+      }
+
+      config.Shards[shardId] = to
+
+      toGroup := groupShards[to]
+      toGroup.need--
+      groupShards[to] = toGroup
+    }
+  }
+
+  for shardId, gid := range config.Shards {
+    PrintDebugGreen("rebalance: shardId: %v, gid: %v", shardId, gid)
+  }
+}
+
+func (sc *ShardCtrler) createGroupShard(
+  config *Config,
+) (map[int]GroupShard, []GroupShard) {
+  groupShards := make(map[int]GroupShard)
+  for gid := range config.Groups {
+    if gid == 0 {
+      continue
+    }
+    groupShards[gid] = GroupShard{}
+  }
+  for _, gid := range config.Shards {
+    if gid == 0 {
+      continue
+    }
+    g := groupShards[gid]
+    g.has++
+    groupShards[gid] = g
+  }
+
+  groupOrder := make([]GroupShard, len(groupShards))
+  i := 0
+  for gid, groupShard := range groupShards {
+    groupOrder[i] = GroupShard {
+      gid: gid,
+      has: groupShard.has,
+    }
+    i++
+  }
+
+  sort.Slice(groupOrder, func(i, j int) bool {
+    g1 := groupOrder[i]
+    g2 := groupOrder[j]
+    return (g1.has < g2.has) ||
+      (g1.has == g2.has && g1.gid < g2.gid)
+  })
+
+  return groupShards, groupOrder
+}
+
+func (sc *ShardCtrler) createTargetSlice(groupSize int) []int {
+  target := make([]int, groupSize)
+
+  remainShard := NShards
+  for i := 0; i < len(target); i++ {
+    quota := remainShard / (groupSize - i)
+    target[i] = quota
+    remainShard -= quota
+  }
+
+  return target
 }
 
 func (sc *ShardCtrler) processMove(args *MoveArgs) {
   sc.mu.Lock()
   defer sc.mu.Unlock()
 
-  config := sc.addConfig()
+  sc.addConfig()
+  config := sc.configs[len(sc.configs) - 1]
   config.Shards[args.Shard] = args.GID
 }
 
 // Caller must hold the mutex.
 // Duplicate the latest config into configs.
-func (sc *ShardCtrler) addConfig() Config {
-  latestConfig := sc.configs[sc.cmdNum]
+func (sc *ShardCtrler) addConfig() {
+  latestConfig := sc.configs[len(sc.configs) - 1]
 
-  sc.cmdNum++
   config := Config {
-    Num: sc.cmdNum,
+    Num:    len(sc.configs),
+    Groups: make(map[int][]string),
   }
 
   for i := 0; i < len(config.Shards); i++ {
@@ -262,8 +408,6 @@ func (sc *ShardCtrler) addConfig() Config {
   }
 
   sc.configs = append(sc.configs, config)
-
-  return config
 }
 
 func (sc *ShardCtrler) isCommitted(clerkId int64, cmdId int64) bool {
@@ -271,6 +415,10 @@ func (sc *ShardCtrler) isCommitted(clerkId int64, cmdId int64) bool {
   defer sc.mu.Unlock()
 
   prevCmdId, _ := sc.history[clerkId]
+
+  if prevCmdId >= cmdId {
+    PrintDebug("cmd: clerkId: %v, cmdId: %v is committed", clerkId, cmdId)
+  }
   return prevCmdId >= cmdId
 }
 
@@ -290,8 +438,6 @@ func (sc *ShardCtrler) deleteHandler(index int) {
   sc.mu.Lock()
   defer sc.mu.Unlock()
 
-  PrintDebugYellow(
-    "%v: start to delete handler: %v", sc.me, index)
   oldHandler, exists := sc.handlers[index]
   if exists {
     close(*oldHandler)
@@ -334,9 +480,8 @@ func StartServer(
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
-  sc.cmdNum = 0
-  config := Config{}
-  sc.configs = append(sc.configs, config)
+  sc.history = make(map[int64]int64)
+  sc.handlers = make(map[int]*chan raft.ApplyMsg)
 
   go sc.receiveCmd()
 
