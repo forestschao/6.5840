@@ -90,6 +90,7 @@ func (ck *Clerk) Get(key string) string {
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+          args.CmdId = ck.getCmdId()
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -126,6 +127,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+          args.CmdId = ck.getCmdId()
 					break
 				}
 				// ... not ok, or ErrWrongLeader
