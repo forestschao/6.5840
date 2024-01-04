@@ -44,6 +44,12 @@ const (
   OpGet = "Get"
   OpPutAppend = "PutAppend"
   OpShards = "Shards"
+  OpConfig = "Config"
+
+  ShardReady = "ShardReady"
+  ShardHandoff = "ShardHandoff"
+  ShardWaiting = "ShardWaiting"
+  ShardWrongGroup = "ShardWrongGroup"
 )
 
 const opTimeout = 100 // Milliseconds
@@ -56,9 +62,9 @@ type Op struct {
   Type         string
   ClerkId      int64
   CmdId        int64
-  Key          string
   GetArg       GetArgs
   PutAppendArg PutAppendArgs
+  ConfigArg    ConfigArgs
   ShardsArg    ShardsArgs
 }
 
@@ -77,6 +83,8 @@ type ShardKV struct {
   history  map[int64]int64             // Clerk Id -> Latest CmdId
   handlers map[int]*chan raft.ApplyMsg // Log index -> handler
 
+  shardState [shardctrler.NShards]string
+
   persister *raft.Persister
 
   sm       *shardctrler.Clerk
@@ -87,44 +95,77 @@ func (kv *ShardKV) receiveConfig() {
   for {
     newConfig := kv.sm.Query(-1)
 
+    needReconfig := false
+
     kv.mu.Lock()
 
     _, isLeader := kv.rf.GetState()
-
-    if isLeader && newConfig.Num > kv.config.Num {
-      kv.reconfig(&newConfig)
-    }
+    needReconfig = isLeader && newConfig.Num >= kv.config.Num
 
     kv.mu.Unlock()
+
+    if needReconfig {
+      kv.reconfig(&newConfig)
+    }
 
     time.Sleep(100 * time.Millisecond)
   }
 }
 
 func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
-  // Copy all the data of the original shards.
-  data := make(map[string]string)
-  for key, value := range kv.data {
-    if kv.correctShard(key) {
-      data[key] = value
-    }
+  // // Copy all the data of the original shards.
+  // data := make(map[string]string)
+  // for key, value := range kv.data {
+  //   if kv.correctShard(key) {
+  //     data[key] = value
+  //   }
+  // }
+
+  // kv.updateShardState(newConfig.Shards[:])
+  // // Get GIDs to which sends shards.
+  // receivers := kv.getShardsReceivers(newConfig)
+
+  // kv.config = *newConfig
+  PrintDebug("%v Update shards: %v", kv.me, newConfig.Shards)
+
+  // Send config args
+  args := ConfigArgs {
+    Num:     newConfig.Num,
+    Shards:  newConfig.Shards[:],
+    Groups:  newConfig.Groups,
   }
 
-  // Get GIDs to which sends shards.
-  receivers := kv.getShardsReceivers(newConfig)
-
-  kv.config = *newConfig
-
-  // Send shards
-  args := ShardsArgs {
-    Num:  kv.config.Num,
-    From: kv.gid,
-    Data: data,
+  op := Op {
+    From:      kv.me,
+    Type:      OpConfig,
+    ClerkId:   int64(kv.gid),
+    CmdId:     int64(args.Num),
+    ConfigArg: args,
   }
 
-  for _, receiver := range receivers {
-    if servers, ok := kv.config.Groups[receiver]; ok {
-      go kv.sendShards(&args, servers)
+  kv.commitOp(&op)
+
+  // for _, receiver := range receivers {
+  //   if servers, ok := kv.config.Groups[receiver]; ok {
+  //     go kv.sendShards(&args, servers)
+  //   }
+  // }
+}
+
+func (kv *ShardKV) updateShardState(newShards []int) {
+  PrintDebug("receive shards: %v", newShards)
+  shards := kv.config.Shards[:]
+  for i, newGid := range newShards {
+    oldGid := shards[i]
+
+    if (oldGid == kv.gid || oldGid == 0) && newGid == kv.gid {
+      kv.shardState[i] = ShardReady
+    } else if oldGid == kv.gid && newGid != kv.gid {
+      kv.shardState[i] = ShardHandoff
+    } else if oldGid != kv.gid && newGid == kv.gid {
+      kv.shardState[i] = ShardWaiting
+    } else {
+      kv.shardState[i] = ShardWrongGroup
     }
   }
 }
@@ -266,6 +307,8 @@ func (kv *ShardKV) processOp(op Op) {
     kv.processPutAppend(&op.PutAppendArg)
   case OpShards:
     kv.processShards(&op.ShardsArg)
+  case OpConfig:
+    kv.processConfig(&op.ConfigArg)
   }
 }
 
@@ -273,12 +316,24 @@ func (kv *ShardKV) processOp(op Op) {
 func (kv *ShardKV) correctShard(key string) bool {
   shard := key2shard(key)
   gid := kv.config.Shards[shard]
+  if gid != kv.gid {
+    PrintDebugRed("Wrong group: expect: %v, get: %v", kv.gid, gid)
+  }
   return gid == kv.gid
+}
+
+func (kv *ShardKV) shardReady(key string) bool {
+  shard := key2shard(key)
+  if kv.shardState[shard] != ShardReady {
+    PrintDebugRed("Shard %v is not ready: %v", shard, kv.shardState[shard])
+  }
+  return true
+  // return kv.shardState[shard] == ShardReady
 }
 
 // Caller must hold the mutex.
 func (kv *ShardKV) processPutAppend(args *PutAppendArgs) {
-  if !kv.correctShard(args.Key) {
+  if !kv.correctShard(args.Key) || !kv.shardReady(args.Key) {
     return
   }
 
@@ -287,6 +342,21 @@ func (kv *ShardKV) processPutAppend(args *PutAppendArgs) {
   } else if args.Op == "Append" {
     oldValue, _ := kv.data[args.Key]
     kv.data[args.Key] = oldValue + args.Value
+  }
+}
+
+// Caller must hold the mutex.
+func (kv *ShardKV) processConfig(args *ConfigArgs) {
+  PrintDebug("processConfig: shard: %v", args.Shards)
+  kv.config.Num = args.Num
+
+  for shard, gid := range args.Shards {
+    kv.config.Shards[shard] = gid
+  }
+
+  kv.config.Groups = make(map[int][]string)
+  for gid, servers := range args.Groups {
+    kv.config.Groups[gid] = servers
   }
 }
 
@@ -340,6 +410,9 @@ func (kv *ShardKV) deleteHandler(index int) {
 
 func (kv *ShardKV) commitOp(op *Op) Err {
   if kv.isCommitted(op.ClerkId, op.CmdId) {
+    PrintDebug(
+      "%v: op (clerkId %v, cmdId %v) is committed",
+      kv.me, op.ClerkId, op.CmdId)
     return OK
   }
 
@@ -350,10 +423,10 @@ func (kv *ShardKV) commitOp(op *Op) Err {
   PrintDebug("commit op: type: %v, clerkId: %v, cmdId: %v",
     op.Type, op.ClerkId, op.CmdId)
 
-  return kv.waitForRaft(index, term, op.Key)
+  return kv.waitForRaft(index, term)
 }
 
-func (kv *ShardKV) waitForRaft(index int, term int, key string) Err {
+func (kv *ShardKV) waitForRaft(index int, term int) Err {
   wait := make(chan raft.ApplyMsg)
 
   kv.setHandler(index, &wait)
@@ -377,9 +450,13 @@ func (kv *ShardKV) waitForRaft(index int, term int, key string) Err {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
-  if !kv.correctShard(key) {
-    return ErrWrongGroup
-  }
+  // if !kv.correctShard(key) {
+  //   return ErrWrongGroup
+  // }
+
+  // if !kv.shardReady(key) {
+  //   return ErrShardNotReady
+  // }
 
   PrintDebugYellow(
     "%v: receive raft index: %v, term: %v", kv.me, index, term)
@@ -388,14 +465,15 @@ func (kv *ShardKV) waitForRaft(index int, term int, key string) Err {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-  PrintDebugGreen("%v: %s %v: {%v}", kv.me, "Get", args.CmdId, args.Key)
+  PrintDebugGreen(
+    "%v: %s %v: {%v} (shard: %v)",
+    kv.me, "Get", args.CmdId, args.Key, key2shard(args.Key))
 
   op := Op {
     From:    kv.me,
     Type:    OpGet,
     ClerkId: args.ClerkId,
     CmdId:   args.CmdId,
-    Key:     args.Key,
     GetArg:  *args,
   }
   reply.Err = kv.commitOp(&op)
@@ -423,15 +501,14 @@ func (kv *ShardKV) getValue(key string, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-  PrintDebugGreen("%v: %s %v: %v -> {%v}",
-    kv.me, args.Op, args.CmdId, args.Key, args.Value)
+  PrintDebugGreen("%v: %s %v: %v (shard: %v) -> {%v}",
+    kv.me, args.Op, args.CmdId, args.Key, key2shard(args.Key), args.Value)
 
   op := Op {
     From:         kv.me,
     Type:         OpPutAppend,
     ClerkId:      args.ClerkId,
     CmdId:        args.CmdId,
-    Key:          args.Key,
     PutAppendArg: *args,
   }
 
@@ -528,6 +605,10 @@ func StartServer(
   }
 
   kv.sm = shardctrler.MakeClerk(ctrlers)
+
+  for i := 0; i < len(kv.shardState); i++ {
+    kv.shardState[i] = ShardWrongGroup
+  }
 
   go kv.receiveMsg()
   go kv.receiveConfig()

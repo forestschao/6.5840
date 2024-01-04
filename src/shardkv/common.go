@@ -10,12 +10,13 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
-	ErrTimeout     = "ErrTimeout"
-	ErrLoseLeader  = "ErrLoseLeader"
+	OK               = "OK"
+	ErrNoKey         = "ErrNoKey"
+	ErrWrongGroup    = "ErrWrongGroup"
+	ErrWrongLeader   = "ErrWrongLeader"
+	ErrTimeout       = "ErrTimeout"
+	ErrLoseLeader    = "ErrLoseLeader"
+	ErrShardNotReady = "ErrShardNotReady"
 )
 
 type Err string
@@ -47,6 +48,16 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type ConfigArgs struct {
+  Num     int
+  Shards  []int
+  Groups  map[int][]string
+}
+
+type ConfigReply struct {
+  Err  Err
 }
 
 type ShardsArgs struct {
