@@ -87,8 +87,10 @@ type ShardKV struct {
 
   persister *raft.Persister
 
-  sm       *shardctrler.Clerk
-  config   shardctrler.Config
+  sm        *shardctrler.Clerk
+  config    shardctrler.Config
+  prevShard ShardsArgs
+  receivers []int  // GIDs of the receiver groups.
 }
 
 func (kv *ShardKV) receiveConfig() {
@@ -113,19 +115,6 @@ func (kv *ShardKV) receiveConfig() {
 }
 
 func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
-  // // Copy all the data of the original shards.
-  // data := make(map[string]string)
-  // for key, value := range kv.data {
-  //   if kv.correctShard(key) {
-  //     data[key] = value
-  //   }
-  // }
-
-  // kv.updateShardState(newConfig.Shards[:])
-  // // Get GIDs to which sends shards.
-  // receivers := kv.getShardsReceivers(newConfig)
-
-  // kv.config = *newConfig
   PrintDebug("%v Update shards: %v", kv.me, newConfig.Shards)
 
   // Send config args
@@ -150,36 +139,6 @@ func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
   //     go kv.sendShards(&args, servers)
   //   }
   // }
-}
-
-func (kv *ShardKV) updateShardState(newShards []int) {
-  PrintDebug("receive shards: %v", newShards)
-  shards := kv.config.Shards[:]
-  for i, newGid := range newShards {
-    oldGid := shards[i]
-
-    if (oldGid == kv.gid || oldGid == 0) && newGid == kv.gid {
-      kv.shardState[i] = ShardReady
-    } else if oldGid == kv.gid && newGid != kv.gid {
-      kv.shardState[i] = ShardHandoff
-    } else if oldGid != kv.gid && newGid == kv.gid {
-      kv.shardState[i] = ShardWaiting
-    } else {
-      kv.shardState[i] = ShardWrongGroup
-    }
-  }
-}
-
-func (kv *ShardKV) getShardsReceivers(
-  newConfig * shardctrler.Config,
-) []int {
-  receivers := []int{}
-  for i, newGid := range newConfig.Shards {
-    if kv.config.Shards[i] == kv.gid && newGid != kv.gid {
-      receivers = append(receivers, newGid)
-    }
-  }
-  return receivers
 }
 
 func (kv *ShardKV) sendShards(args *ShardsArgs, servers []string) {
@@ -293,6 +252,7 @@ func (kv *ShardKV) sendSnapshot(index int) {
   kv.rf.Snapshot(index, compressedData.Bytes())
 }
 
+// Caller must hold the mutex.
 func (kv *ShardKV) processOp(op Op) {
   // TODO: Probably we don't need to check it.
   prevCmdId, _ := kv.history[op.ClerkId]
@@ -348,6 +308,12 @@ func (kv *ShardKV) processPutAppend(args *PutAppendArgs) {
 // Caller must hold the mutex.
 func (kv *ShardKV) processConfig(args *ConfigArgs) {
   PrintDebug("processConfig: shard: %v", args.Shards)
+
+  kv.saveShards(args)
+  kv.updateShardState(args.Shards[:])
+  kv.setShardsReceivers(args.Shards[:])
+
+  // Update config.
   kv.config.Num = args.Num
 
   for shard, gid := range args.Shards {
@@ -358,6 +324,50 @@ func (kv *ShardKV) processConfig(args *ConfigArgs) {
   for gid, servers := range args.Groups {
     kv.config.Groups[gid] = servers
   }
+}
+
+func (kv *ShardKV) saveShards(newConfig *ConfigArgs) {
+  // Copy all the data of the original shards.
+  data := make(map[string]string)
+  for key, value := range kv.data {
+    if kv.correctShard(key) {
+      data[key] = value
+    }
+  }
+
+  kv.prevShard = ShardsArgs {
+    ClerkId: int64(kv.gid),
+    CmdId:   int64(newConfig.Num),
+    Num:     newConfig.Num,
+    Data:    data,
+  }
+}
+
+func (kv *ShardKV) updateShardState(newShards []int) {
+  PrintDebug("updateShardState: %v", newShards)
+  shards := kv.config.Shards[:]
+  for i, newGid := range newShards {
+    oldGid := shards[i]
+
+    if oldGid == 0 || newGid == 0 || oldGid == newGid {
+      kv.shardState[i] = ShardReady
+    } else if oldGid == kv.gid && newGid != kv.gid {
+      kv.shardState[i] = ShardHandoff
+    } else if oldGid != kv.gid && newGid == kv.gid {
+      kv.shardState[i] = ShardWaiting
+    }
+  }
+}
+
+func (kv *ShardKV) setShardsReceivers(shards []int) {
+  receivers := []int{}
+  for i, newGid := range shards {
+    if kv.config.Shards[i] == kv.gid && newGid != kv.gid {
+      receivers = append(receivers, newGid)
+    }
+  }
+
+  kv.receivers = receivers
 }
 
 // Caller must hold the mutex.
