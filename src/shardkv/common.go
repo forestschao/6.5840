@@ -68,5 +68,6 @@ type ShardsArgs struct {
 }
 
 type ShardsReply struct {
-  Err  Err
+  Err    Err
+  Shards []int
 }

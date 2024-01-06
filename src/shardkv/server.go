@@ -90,7 +90,7 @@ type ShardKV struct {
   sm        *shardctrler.Clerk
   config    shardctrler.Config
   prevShard ShardsArgs
-  receivers []int  // GIDs of the receiver groups.
+  receivers map[int]int  // Shard Id -> Receiver GID
 }
 
 func (kv *ShardKV) receiveConfig() {
@@ -141,18 +141,61 @@ func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
   // }
 }
 
-func (kv *ShardKV) sendShards(args *ShardsArgs, servers []string) {
-  // try each server for the shard.
-  for si := 0; si < len(servers); si++ {
-    srv := kv.make_end(servers[si])
-    var reply ShardsReply
-    ok := srv.Call("ShardKV.ReceiveShards", args, &reply)
-    if ok && reply.Err != ErrWrongLeader {
-      return
+func (kv *ShardKV) pushShards() {
+  for {
+    // Deduplicate receiver gid.
+    receiverGid := make(map[int]bool)
+
+    kv.mu.Lock()
+
+    for shard, state := range kv.shardState {
+      if state == ShardHandoff {
+        gid := kv.receivers[shard]
+        receiverGid[gid] = true
+      }
     }
+
+    kv.mu.Unlock()
+
+    for gid, _ := range receiverGid {
+      go kv.sendShards(&kv.prevShard, gid)
+    }
+
+    time.Sleep(100 * time.Millisecond)
   }
 }
 
+func (kv *ShardKV) sendShards(args *ShardsArgs, gid int) {
+  for {
+    kv.mu.Lock()
+    servers, exists := kv.config.Groups[gid]
+    kv.mu.Unlock()
+
+    if exists {
+      for si := 0; si < len(servers); si++ {
+        var reply ShardsReply
+
+        srv := kv.make_end(servers[si])
+        ok := srv.Call("ShardKV.ReceiveShards", args, &reply)
+        if ok && reply.Err == OK {
+          kv.completePushShards(reply.Shards)
+          return
+        }
+      }
+    }
+    time.Sleep(100 * time.Millisecond)
+  }
+}
+
+// Caller must not hold mutex.
+func (kv *ShardKV) completePushShards(shards []int) {
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  for _, shard := range shards {
+    kv.shardState[shard] = ShardReady
+  }
+}
 
 func (kv *ShardKV) receiveMsg() {
   for msg := range kv.applyCh {
@@ -360,10 +403,10 @@ func (kv *ShardKV) updateShardState(newShards []int) {
 }
 
 func (kv *ShardKV) setShardsReceivers(shards []int) {
-  receivers := []int{}
+  receivers := make(map[int]int)
   for i, newGid := range shards {
     if kv.config.Shards[i] == kv.gid && newGid != kv.gid {
-      receivers = append(receivers, newGid)
+      receivers[i] = newGid
     }
   }
 
