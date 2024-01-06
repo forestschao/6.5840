@@ -133,29 +133,11 @@ func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
   }
 
   kv.commitOp(&op)
-
-  // for _, receiver := range receivers {
-  //   if servers, ok := kv.config.Groups[receiver]; ok {
-  //     go kv.sendShards(&args, servers)
-  //   }
-  // }
 }
 
 func (kv *ShardKV) pushShards() {
   for {
-    // Deduplicate receiver gid.
-    receiverGid := make(map[int]bool)
-
-    kv.mu.Lock()
-
-    for shard, state := range kv.shardState {
-      if state == ShardHandoff {
-        gid := kv.receivers[shard]
-        receiverGid[gid] = true
-      }
-    }
-
-    kv.mu.Unlock()
+    receiverGid := kv.getReceivers()
 
     for gid, _ := range receiverGid {
       go kv.sendShards(&kv.prevShard, gid)
@@ -163,6 +145,28 @@ func (kv *ShardKV) pushShards() {
 
     time.Sleep(100 * time.Millisecond)
   }
+}
+
+// Caller must not hold mutex.
+// Deduplicate receiver gid. Returns empty if not leader.
+func (kv *ShardKV) getReceivers() map[int]bool {
+  receiverGid := make(map[int]bool)
+
+  _, isLeader := kv.rf.GetState()
+  if !isLeader {
+    return receiverGid
+  }
+
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  for shard, state := range kv.shardState {
+    if state == ShardHandoff {
+      gid := kv.receivers[shard]
+      receiverGid[gid] = true
+    }
+  }
+  return receiverGid
 }
 
 func (kv *ShardKV) sendShards(args *ShardsArgs, gid int) {
@@ -192,6 +196,7 @@ func (kv *ShardKV) completePushShards(shards []int) {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
+  // TODO: We may need to use raft to save the state.
   for _, shard := range shards {
     kv.shardState[shard] = ShardReady
   }
