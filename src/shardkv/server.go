@@ -12,7 +12,7 @@ import "io/ioutil"
 import "sync"
 import "time"
 
-const DebugMode = true
+const DebugMode = false
 
 func PrintDebug(format string, a ...interface{}) {
   PrintDebugInternal("\033[0m", format, a...)
@@ -335,7 +335,7 @@ func (kv *ShardKV) processOp(op Op) Reply {
     return reply
   }
 
-  PrintDebugGreen(
+  PrintDebug(
     "%v: start to process: %v, clerkId: %v, cmdId: %v",
     kv.gid, op.Type, op.ClerkId, op.CmdId)
 
@@ -393,15 +393,17 @@ func (kv *ShardKV) processPutAppend(
     "%v: PutAppend: key: %v (shard: %v) -> value: %v cmdId: %v",
     kv.gid, args.Key, key2shard(args.Key), args.Value, 
     args.CmdId)
+
   if !kv.correctShard(args.Key) || !kv.shardReady(args.Key) {
     if !kv.correctShard(args.Key) {
       shard := key2shard(args.Key)
       gid := kv.config.Shards[shard]
       PrintDebugRed(
-        "%v: Wrong group: me: %v, target: %v, cmdId: %v",
+        "%v: PutAppend Wrong group: me: %v, target: %v, cmdId: %v",
         kv.gid, kv.gid, gid, args.CmdId)
     }
     reply.Err = ErrWrongGroup
+    return
   }
 
   if args.Op == "Put" {
@@ -483,7 +485,8 @@ func (kv *ShardKV) setShardsReceivers(shards []int) {
 // Caller must hold the mutex.
 func (kv *ShardKV) isNeeded(key string, from int64) bool {
   shard := key2shard(key)
-  return int64(kv.prevConfig.Shards[shard]) == from &&
+  prevShard := kv.prevConfig.Shards[shard]
+  return (prevShard == int(from) || prevShard == 0) &&
     kv.config.Shards[shard] == kv.gid
 }
 
@@ -494,28 +497,29 @@ func (kv *ShardKV) processShards(
 ) {
   reply.Err = OK
 
-  if args.Num < kv.config.Num {
-    return
-  }
-
-  for key, value := range args.Data {
-    if kv.isNeeded(key, args.ClerkId) {
-      kv.data[key] = value
-      PrintDebugYellow(
-        "             %v: receive shards: key: %v, value: %v",
-        kv.gid, key, value)
+  // Update shard data
+  if args.Num >= kv.config.Num {
+    for key, value := range args.Data {
+      if kv.isNeeded(key, args.ClerkId) {
+        kv.data[key] = value
+        PrintDebug(
+          "             %v: receive shards: key: %v, value: %v",
+          kv.gid, key, value)
+      }
     }
   }
 
+  PrintDebugYellow("%v: processShards prev shards %v", kv.gid, kv.prevConfig.Shards)
+  PrintDebugYellow("%v: processShards new  shards %v", kv.gid, kv.config.Shards)
   receiveShards := []int{}
   for shard, gid := range kv.prevConfig.Shards {
-    if int64(gid) == args.ClerkId && 
+    if (gid == int(args.ClerkId) || gid == 0) &&
        kv.config.Shards[shard] == kv.gid {
       kv.shardState[shard] = ShardReady
       receiveShards = append(receiveShards, shard)
     }
   }
-  PrintDebugYellow("%v: receive shards %v", kv.gid, receiveShards)
+  PrintDebugYellow("%v: processShards done receive shards %v", kv.gid, receiveShards)
 
   reply.Shards = receiveShards
 }
@@ -606,10 +610,8 @@ func (kv *ShardKV) waitForRaft(index int, term int) Reply {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-  PrintDebugGreen(
-    "%v: %v %v: {%v} (shard: %v) cmdId: %v",
-    kv.gid, args.CmdId, "Get", args.Key,
-    key2shard(args.Key), args.CmdId)
+  PrintDebug("%v: %v %v: {%v} (shard: %v) cmdId: %v",
+    kv.gid, args.CmdId, "Get", args.Key, key2shard(args.Key), args.CmdId)
 
   // kv.mu.Lock()
   // if !kv.correctShard(args.Key) {
@@ -643,7 +645,7 @@ func (kv *ShardKV) getValue(key string, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-  PrintDebugGreen("%v: %v %s: %v (shard: %v) -> {%v}",
+  PrintDebug("%v: %v %s: %v (shard: %v) -> {%v}",
     kv.gid, args.CmdId, args.Op, args.Key, key2shard(args.Key), args.Value)
 
   op := Op {
