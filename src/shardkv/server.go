@@ -328,7 +328,7 @@ func (kv *ShardKV) processOp(op Op) Reply {
 
   // TODO: Probably we don't need to check it.
   prevCmdId, _ := kv.history[op.ClerkId]
-  if prevCmdId >= op.CmdId {
+  if op.Type != OpReceiveShards && prevCmdId >= op.CmdId {
     PrintDebugYellow(
       "%v: %v is committed, clerkId: %v, cmdId: %v",
       kv.gid, op.Type, op.ClerkId, op.CmdId)
@@ -562,7 +562,7 @@ func (kv *ShardKV) deleteHandler(index int) {
 func (kv *ShardKV) commitOp(op *Op) Reply {
   reply := kv.emptyReply()
 
-  if kv.isCommitted(op.ClerkId, op.CmdId) {
+  if op.Type != OpReceiveShards && kv.isCommitted(op.ClerkId, op.CmdId) {
     PrintDebugYellow(
       "%v: op (clerkId %v, cmdId %v) is committed",
       kv.gid, op.ClerkId, op.CmdId)
