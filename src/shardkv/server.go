@@ -68,9 +68,11 @@ type Op struct {
   ShardsArg    ShardsArgs
 }
 
-type Result struct {
-  Err   Err
-  Value string
+type Reply struct {
+  GetReply       GetReply
+  PutAppendReply PutAppendReply
+  ConfigReply    ConfigReply
+  ShardsReply    ShardsReply
 }
 
 type ShardKV struct {
@@ -86,7 +88,7 @@ type ShardKV struct {
 	// Your definitions here.
   data     map[string]string           // Key -> Value
   history  map[int64]int64             // Clerk Id -> Latest CmdId
-  handlers map[int]*chan Result // Log index -> handler
+  handlers map[int]*chan Reply // Log index -> handler
 
   shardState [shardctrler.NShards]string
 
@@ -265,7 +267,7 @@ func (kv *ShardKV) executeCmd(msg raft.ApplyMsg) {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
-  result := kv.processOp(op)
+  reply := kv.processOp(op)
 
   if kv.needSnapshot() {
     kv.sendSnapshot(msg.CommandIndex)
@@ -274,7 +276,7 @@ func (kv *ShardKV) executeCmd(msg raft.ApplyMsg) {
 
   handler, exists := kv.handlers[msg.CommandIndex]
   if exists {
-    *handler <- result
+    *handler <- reply
   }
 }
 
@@ -303,18 +305,34 @@ func (kv *ShardKV) sendSnapshot(index int) {
   kv.rf.Snapshot(index, compressedData.Bytes())
 }
 
+func (kv* ShardKV) emptyReply() Reply {
+  reply := Reply {
+    GetReply:       GetReply       { Err: OK },
+    PutAppendReply: PutAppendReply { Err: OK },
+    ConfigReply:    ConfigReply    { Err: OK },
+    ShardsReply:    ShardsReply    { Err: OK },
+  }
+  return reply
+}
+
+func (kv* ShardKV) setErr(reply *Reply, err Err) {
+  reply.GetReply.Err       = err
+  reply.PutAppendReply.Err = err
+  reply.ConfigReply.Err    = err
+  reply.ShardsReply.Err    = err
+}
+
 // Caller must hold the mutex.
-func (kv *ShardKV) processOp(op Op) Result {
+func (kv *ShardKV) processOp(op Op) Reply {
+  reply := kv.emptyReply()
+
   // TODO: Probably we don't need to check it.
   prevCmdId, _ := kv.history[op.ClerkId]
-  result := Result {
-    Err: OK,
-  }
   if prevCmdId >= op.CmdId {
     PrintDebugYellow(
       "%v: %v is committed, clerkId: %v, cmdId: %v",
       kv.gid, op.Type, op.ClerkId, op.CmdId)
-    return result
+    return reply
   }
 
   PrintDebugGreen(
@@ -325,31 +343,28 @@ func (kv *ShardKV) processOp(op Op) Result {
 
   switch op.Type {
   case OpGet:
-    return kv.processGet(&op.GetArg)
+    kv.processGet(&op.GetArg, &reply.GetReply)
   case OpPutAppend:
-    result.Err = kv.processPutAppend(&op.PutAppendArg)
+    kv.processPutAppend(&op.PutAppendArg, &reply.PutAppendReply)
   case OpReceiveShards:
-    result.Err = kv.processShards(&op.ShardsArg)
+    kv.processShards(&op.ShardsArg, &reply.ShardsReply)
   case OpConfig:
-    result.Err = kv.processConfig(&op.ConfigArg)
+    kv.processConfig(&op.ConfigArg, &reply.ConfigReply)
   }
-  return result
+  return reply
 }
 
-func (kv *ShardKV) processGet(args *GetArgs) Result {
-  result := Result{}
+func (kv *ShardKV) processGet(args *GetArgs, reply *GetReply) {
   if !kv.correctShard(args.Key) {
     shard := key2shard(args.Key)
     gid := kv.config.Shards[shard]
     PrintDebugRed(
       "%v: Get Wrong group: me: %v, target: %v",
       kv.gid, kv.gid, gid)
-    result.Err = ErrWrongGroup
-    return result
+    reply.Err = ErrWrongGroup
   }
 
-  kv.getValue(args.Key, &result)
-  return result
+  kv.getValue(args.Key, reply)
 }
 
 // Caller must hold the mutex.
@@ -370,7 +385,10 @@ func (kv *ShardKV) shardReady(key string) bool {
 }
 
 // Caller must hold the mutex.
-func (kv *ShardKV) processPutAppend(args *PutAppendArgs) Err {
+func (kv *ShardKV) processPutAppend(
+  args *PutAppendArgs,
+  reply *PutAppendReply,
+) {
   PrintDebug(
     "%v: PutAppend: key: %v (shard: %v) -> value: %v cmdId: %v",
     kv.gid, args.Key, key2shard(args.Key), args.Value, 
@@ -383,7 +401,7 @@ func (kv *ShardKV) processPutAppend(args *PutAppendArgs) Err {
         "%v: Wrong group: me: %v, target: %v, cmdId: %v",
         kv.gid, kv.gid, gid, args.CmdId)
     }
-    return ErrWrongGroup
+    reply.Err = ErrWrongGroup
   }
 
   if args.Op == "Put" {
@@ -392,11 +410,11 @@ func (kv *ShardKV) processPutAppend(args *PutAppendArgs) Err {
     oldValue, _ := kv.data[args.Key]
     kv.data[args.Key] = oldValue + args.Value
   }
-  return OK
+  reply.Err = OK
 }
 
 // Caller must hold the mutex.
-func (kv *ShardKV) processConfig(args *ConfigArgs) Err {
+func (kv *ShardKV) processConfig(args *ConfigArgs, reply *ConfigReply) {
   PrintDebug("%v: processConfig: shard: %v", kv.gid, args.Shards)
 
   kv.saveShards(args)
@@ -416,7 +434,7 @@ func (kv *ShardKV) processConfig(args *ConfigArgs) Err {
     kv.config.Groups[gid] = servers
   }
 
-  return OK
+  reply.Err = OK
 }
 
 func (kv *ShardKV) saveShards(newConfig *ConfigArgs) {
@@ -463,13 +481,25 @@ func (kv *ShardKV) setShardsReceivers(shards []int) {
 }
 
 // Caller must hold the mutex.
-func (kv *ShardKV) processShards(args *ShardsArgs) Err {
+func (kv *ShardKV) isNeeded(key string, from int64) bool {
+  shard := key2shard(key)
+  return int64(kv.prevConfig.Shards[shard]) == from &&
+    kv.config.Shards[shard] == kv.gid
+}
+
+// Caller must hold the mutex.
+func (kv *ShardKV) processShards(
+  args *ShardsArgs,
+  reply *ShardsReply,
+) {
+  reply.Err = OK
+
   if args.Num < kv.config.Num {
-    return OK
+    return
   }
 
   for key, value := range args.Data {
-    if kv.correctShard(key) {
+    if kv.isNeeded(key, args.ClerkId) {
       kv.data[key] = value
       PrintDebugYellow(
         "             %v: receive shards: key: %v, value: %v",
@@ -487,7 +517,7 @@ func (kv *ShardKV) processShards(args *ShardsArgs) Err {
   }
   PrintDebugYellow("%v: receive shards %v", kv.gid, receiveShards)
 
-  return OK
+  reply.Shards = receiveShards
 }
 
 // Caller mustn't hold the mutex.
@@ -499,7 +529,7 @@ func (kv *ShardKV) isCommitted(clerkId int64, cmdId int64) bool {
   return prevCmdId >= cmdId
 }
 
-func (kv *ShardKV) setHandler(index int, handler *chan Result) {
+func (kv *ShardKV) setHandler(index int, handler *chan Reply) {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
@@ -525,16 +555,14 @@ func (kv *ShardKV) deleteHandler(index int) {
   delete(kv.handlers, index)
 }
 
-func (kv *ShardKV) commitOp(op *Op) Result {
-  result := Result {
-    Err: OK,
-  }
+func (kv *ShardKV) commitOp(op *Op) Reply {
+  reply := kv.emptyReply()
 
   if kv.isCommitted(op.ClerkId, op.CmdId) {
     PrintDebugYellow(
       "%v: op (clerkId %v, cmdId %v) is committed",
       kv.gid, op.ClerkId, op.CmdId)
-    return result
+    return reply
   }
 
   index, term, isLeader := kv.rf.Start(*op)
@@ -542,39 +570,38 @@ func (kv *ShardKV) commitOp(op *Op) Result {
     PrintDebugYellow(
       "%v: op (clerkId %v, cmdId %v) wrong leader",
       kv.gid, op.ClerkId, op.CmdId)
-    result.Err = ErrWrongLeader
-    return result
+    kv.setErr(&reply, ErrWrongLeader)
+    return reply
   }
+
   PrintDebug("%v: commit op: type: %v, clerkId: %v, cmdId: %v, index %v",
     kv.gid, op.Type, op.ClerkId, op.CmdId, index)
 
   return kv.waitForRaft(index, term)
 }
 
-func (kv *ShardKV) waitForRaft(index int, term int) Result {
-  wait := make(chan Result)
+func (kv *ShardKV) waitForRaft(index int, term int) Reply {
+  wait := make(chan Reply)
 
   kv.setHandler(index, &wait)
   defer kv.deleteHandler(index)
 
-  result := Result {
-    Err: ErrTimeout,
-  }
+  reply := kv.emptyReply()
 
   select {
   case <-time.After(opTimeout * time.Millisecond):
-    return result
-  case result = <-wait:
+    kv.setErr(&reply, ErrTimeout)
+    return reply
+  case reply = <-wait:
   }
 
   currTerm, isLeader := kv.rf.GetState()
   if !isLeader || currTerm != term {
     PrintDebugYellow("Lose leader.")
-    result.Err = ErrLoseLeader
-    return result
+    kv.setErr(&reply, ErrLoseLeader)
   }
 
-  return result
+  return reply
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -600,13 +627,11 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
     GetArg:  *args,
   }
 
-  result := kv.commitOp(&op)
-  reply.Err = result.Err
-  reply.Value = result.Value
+  *reply = kv.commitOp(&op).GetReply
 }
 
 // Caller should not hold the mutex.
-func (kv *ShardKV) getValue(key string, reply *Result) {
+func (kv *ShardKV) getValue(key string, reply *GetReply) {
   value, exists := kv.data[key]
   reply.Value = value
   if !exists {
@@ -621,14 +646,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
   PrintDebugGreen("%v: %v %s: %v (shard: %v) -> {%v}",
     kv.gid, args.CmdId, args.Op, args.Key, key2shard(args.Key), args.Value)
 
-  // kv.mu.Lock()
-  // if !kv.correctShard(args.Key) {
-  //   reply.Err = ErrWrongLeader
-  //   kv.mu.Unlock()
-  //   return
-  // }
-  // kv.mu.Unlock()
-
   op := Op {
     From:         kv.gid,
     Type:         OpPutAppend,
@@ -637,7 +654,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
     PutAppendArg: *args,
   }
 
-  reply.Err = kv.commitOp(&op).Err
+  *reply = kv.commitOp(&op).PutAppendReply
 }
 
 func (kv *ShardKV) ReceiveShards(args *ShardsArgs, reply *ShardsReply) {
@@ -651,20 +668,7 @@ func (kv *ShardKV) ReceiveShards(args *ShardsArgs, reply *ShardsReply) {
     ShardsArg:    *args,
   }
 
-  reply.Err = kv.commitOp(&op).Err
-
-  if reply.Err != OK {
-    return
-  }
-
-  // Returns updated shards.
-  updateShards := []int{}
-  for shard, gid := range kv.config.Shards {
-    if int64(gid) == args.ClerkId {
-      updateShards = append(updateShards, shard)
-    }
-  }
-  reply.Shards = updateShards
+  *reply = kv.commitOp(&op).ShardsReply
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -734,7 +738,7 @@ func StartServer(
 	// You may need initialization code here.
   kv.data = make(map[string]string)
   kv.history = make(map[int64]int64)
-  kv.handlers = make(map[int]*chan Result)
+  kv.handlers = make(map[int]*chan Reply)
 
   kv.persister = persister
   snapshot := persister.ReadSnapshot()
