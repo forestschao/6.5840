@@ -103,18 +103,38 @@ type ShardKV struct {
 
 func (kv *ShardKV) receiveConfig() {
   for {
-    newConfig := kv.sm.Query(-1)
+    var newConfig shardctrler.Config
 
-    kv.mu.Lock()
-    needReconfig := newConfig.Num > kv.config.Num
-    kv.mu.Unlock()
-
+    needReconfig := kv.getNextConfig(&newConfig)
     if needReconfig {
       kv.reconfig(&newConfig)
     }
 
     time.Sleep(100 * time.Millisecond)
   }
+}
+
+func (kv *ShardKV) getNextConfig(
+  newConfig *shardctrler.Config,
+) bool {
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+
+  // if it is waiting for shards or sending shards
+  // do not reconfig.
+  for shard, state := range kv.shardState {
+    if state != ShardReady {
+      PrintDebugYellow(
+        "%v: skip reconfig: shard %v: %v",
+        kv.gid, shard, state)
+      return false
+    }
+  }
+
+  nextConfigNum := kv.config.Num + 1
+  *newConfig = kv.sm.Query(nextConfigNum)
+
+  return newConfig.Num > kv.config.Num
 }
 
 func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
@@ -763,7 +783,7 @@ func StartServer(
   kv.sm = shardctrler.MakeClerk(ctrlers)
 
   for i := 0; i < len(kv.shardState); i++ {
-    kv.shardState[i] = ShardWrongGroup
+    kv.shardState[i] = ShardReady
   }
 
   go kv.receiveMsg()
