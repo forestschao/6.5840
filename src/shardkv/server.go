@@ -12,7 +12,7 @@ import "io/ioutil"
 import "sync"
 import "time"
 
-const DebugMode = false
+const DebugMode = true
 
 func PrintDebug(format string, a ...interface{}) {
   PrintDebugInternal("\033[0m", format, a...)
@@ -242,7 +242,11 @@ func (kv *ShardKV) ingestSnap(snapshot []byte) {
   d := labgob.NewDecoder(r)
 
   if d.Decode(&kv.data) != nil ||
-    d.Decode(&kv.history) != nil {
+    d.Decode(&kv.history) != nil ||
+    d.Decode(&kv.shardState) != nil ||
+    d.Decode(&kv.prevConfig) != nil ||
+    d.Decode(&kv.prevShard) != nil ||
+    d.Decode(&kv.receivers) != nil {
     PrintDebug("Snapshot decode error")
     return
   }
@@ -291,6 +295,10 @@ func (kv *ShardKV) sendSnapshot(index int) {
   e := labgob.NewEncoder(w)
   e.Encode(kv.data)
   e.Encode(kv.history)
+  e.Encode(&kv.shardState)
+  e.Encode(&kv.prevConfig)
+  e.Encode(&kv.prevShard)
+  e.Encode(&kv.receivers)
 
   // Compress
   var compressedData bytes.Buffer
@@ -420,8 +428,11 @@ func (kv *ShardKV) processConfig(args *ConfigArgs, reply *ConfigReply) {
   PrintDebug("%v: processConfig: shard: %v", kv.gid, args.Shards)
 
   kv.saveShards(args)
+  PrintDebugYellow("%v: processConfig: updateState: %v", kv.gid, args.Shards)
   kv.updateShardState(args.Shards[:])
+  PrintDebugYellow("%v: processConfig: setReceivers: %v", kv.gid, args.Shards)
   kv.setShardsReceivers(args.Shards[:])
+  PrintDebugYellow("%v: processConfig: prev: %v", kv.gid, args.Shards)
   kv.prevConfig = kv.config
 
   // Update config.
@@ -437,6 +448,7 @@ func (kv *ShardKV) processConfig(args *ConfigArgs, reply *ConfigReply) {
   }
 
   reply.Err = OK
+  PrintDebugYellow("%v: processConfig: done: %v", kv.gid, args.Shards)
 }
 
 func (kv *ShardKV) saveShards(newConfig *ConfigArgs) {
@@ -549,7 +561,7 @@ func (kv *ShardKV) deleteHandler(index int) {
   kv.mu.Lock()
   defer kv.mu.Unlock()
 
-  PrintDebugYellow(
+  PrintDebug(
     "%v: start to delete handler: %v", kv.gid, index)
   oldHandler, exists := kv.handlers[index]
   if exists {
