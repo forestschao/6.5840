@@ -40,6 +40,7 @@ type Clerk struct {
 	// You will have to modify this struct.
   me       int64
   cmdId    int64
+  leaderId int
 }
 
 // the tester calls MakeClerk.
@@ -83,17 +84,19 @@ func (ck *Clerk) Get(key string) string {
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+				srv := ck.make_end(servers[ck.leaderId])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+          ck.leaderId = 0
           args.CmdId = ck.getCmdId()
 					break
 				}
 				// ... not ok, or ErrWrongLeader
+        ck.leaderId = (ck.leaderId + 1) % len(servers)
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -122,17 +125,19 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
       // TODO: Remember leader so that it don't need to try 
       // every server each time.
 			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
+				srv := ck.make_end(servers[ck.leaderId])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+          ck.leaderId = 0
           args.CmdId = ck.getCmdId()
 					break
 				}
 				// ... not ok, or ErrWrongLeader
+        ck.leaderId = (ck.leaderId + 1) % len(servers)
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
