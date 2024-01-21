@@ -399,15 +399,19 @@ func (kv *ShardKV) processOp(op Op) Reply {
 	case OpConfig:
 		kv.processConfig(&op.ConfigArg, &reply.ConfigReply)
 	case OpShardState:
-		kv.processShardState(&op.ShardStateArg)
+		kv.processShardState(&op.ShardStateArg, &reply.ShardStateReply)
 	}
 	return reply
 }
 
-func (kv *ShardKV) processShardState(args *ShardStateArgs) {
+func (kv *ShardKV) processShardState(
+  args *ShardStateArgs,
+  reply *ShardStateReply,
+) {
 	for _, shard := range args.Shards {
 		kv.shardState[shard] = ShardReady
 	}
+  reply.Err = OK
 }
 
 func (kv *ShardKV) processGet(args *GetArgs, reply *GetReply) {
