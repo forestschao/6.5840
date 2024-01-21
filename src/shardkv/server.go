@@ -408,21 +408,33 @@ func (kv *ShardKV) processShardState(
   args *ShardStateArgs,
   reply *ShardStateReply,
 ) {
+  PrintDebug(
+    "%v_%v: update shard state: %v",
+    kv.gid, kv.me, args.Shards)
+
 	for _, shard := range args.Shards {
 		kv.shardState[shard] = ShardReady
 	}
   reply.Err = OK
 }
 
-func (kv *ShardKV) processGet(args *GetArgs, reply *GetReply) {
-	if !kv.correctShard(args.Key) {
-		shard := key2shard(args.Key)
-		gid := kv.config.Shards[shard]
-		PrintDebugRed(
-			"%v_%v: Get Wrong group: me: %v, target: %v",
-			kv.gid, kv.me, kv.gid, gid)
-		reply.Err = ErrWrongGroup
+func (kv *ShardKV) checkKeyStatus(key string) Err {
+	if !kv.correctShard(key) {
+    return ErrWrongGroup
 	}
+	if !kv.shardReady(key) {
+		return ErrShardNotReady
+	}
+
+  return OK
+}
+
+func (kv *ShardKV) processGet(args *GetArgs, reply *GetReply) {
+  state := kv.checkKeyStatus(args.Key)
+  if state != OK {
+    reply.Err = state
+    return
+  }
 
 	kv.getValue(args.Key, reply)
 }
@@ -431,6 +443,12 @@ func (kv *ShardKV) processGet(args *GetArgs, reply *GetReply) {
 func (kv *ShardKV) correctShard(key string) bool {
 	shard := key2shard(key)
 	gid := kv.config.Shards[shard]
+
+  if gid != kv.gid {
+		PrintDebugRed(
+			"%v_%v: Get Wrong group: me: %v, target: %v",
+			kv.gid, kv.me, kv.gid, gid)
+  }
 	return gid == kv.gid
 }
 
@@ -454,17 +472,11 @@ func (kv *ShardKV) processPutAppend(
 		kv.gid, kv.me, args.Key, key2shard(args.Key), args.Value,
 		args.CmdId)
 
-	if !kv.correctShard(args.Key) || !kv.shardReady(args.Key) {
-		if !kv.correctShard(args.Key) {
-			shard := key2shard(args.Key)
-			gid := kv.config.Shards[shard]
-			PrintDebugRed(
-				"%v_%v: PutAppend Wrong group: me: %v, target: %v, cmdId: %v",
-				kv.gid, kv.me, kv.gid, gid, args.CmdId)
-		}
-		reply.Err = ErrWrongGroup
-		return
-	}
+  state := kv.checkKeyStatus(args.Key)
+  if state != OK {
+    reply.Err = state
+    return
+  }
 
 	if args.Op == "Put" {
 		kv.data[args.Key] = args.Value
@@ -627,8 +639,6 @@ func (kv *ShardKV) deleteHandler(index int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	PrintDebug(
-		"%v_%v: start to delete handler: %v", kv.gid, kv.me, index)
 	oldHandler, exists := kv.handlers[index]
 	if exists {
 		close(*oldHandler)
