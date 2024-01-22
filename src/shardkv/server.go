@@ -297,6 +297,7 @@ func (kv *ShardKV) ingestSnap(snapshot []byte) {
 	if d.Decode(&kv.data) != nil ||
 		d.Decode(&kv.history) != nil ||
 		d.Decode(&kv.shardState) != nil ||
+    d.Decode(&kv.config) != nil ||
 		d.Decode(&kv.prevShard) != nil ||
 		d.Decode(&kv.receivers) != nil {
 		PrintDebug("Snapshot decode error")
@@ -344,6 +345,7 @@ func (kv *ShardKV) sendSnapshot(index int) {
 	e.Encode(kv.data)
 	e.Encode(kv.history)
 	e.Encode(&kv.shardState)
+  e.Encode(&kv.config)
 	e.Encode(&kv.prevShard)
 	e.Encode(&kv.receivers)
 
