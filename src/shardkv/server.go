@@ -485,6 +485,10 @@ func (kv *ShardKV) processPutAppend(
 		kv.data[args.Key] = oldValue + args.Value
 	}
 	reply.Err = OK
+	PrintDebug(
+		"%v_%v: PutAppend: key: %v (shard: %v) -> value: %v cmdId: %v done",
+		kv.gid, kv.me, args.Key, key2shard(args.Key), args.Value,
+		args.CmdId)
 }
 
 // Caller must hold the mutex.
@@ -555,6 +559,23 @@ func (kv *ShardKV) setShardsReceivers(newShards []int) {
 	kv.receivers = receivers
 }
 
+func (kv *ShardKV) needUpdateShards(
+  configNum int,
+  receiveShards []int,
+) bool {
+  if configNum != kv.config.Num {
+    return false
+  }
+
+  for _, shard := range receiveShards {
+    if kv.shardState[shard] == ShardReady {
+      return false
+    }
+  }
+
+  return true
+}
+
 // Caller must hold the mutex.
 func (kv *ShardKV) processShards(
 	args *ShardsArgs,
@@ -565,7 +586,7 @@ func (kv *ShardKV) processShards(
 	receiveShards := kv.getReceiveShards(args.Num, args.ClerkId)
 
 	// Update shard data
-	if args.Num == kv.config.Num {
+  if kv.needUpdateShards(args.Num, receiveShards) {
 		for key, value := range args.Data {
 			if kv.correctShard(key) {
 				kv.data[key] = value
