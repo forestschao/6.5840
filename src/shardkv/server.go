@@ -73,6 +73,8 @@ type Op struct {
 }
 
 type ShardStateArgs struct {
+  Gid    int
+  Num    int
 	Shards []int
 }
 
@@ -150,7 +152,9 @@ func (kv *ShardKV) getNextConfig(
 }
 
 func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
-	PrintDebug("%v_%v: reconfig shards: %v", kv.gid, kv.me, newConfig.Shards)
+	PrintDebug(
+    "%v_%v: reconfig shards: %v\n                                  -> %v",
+    kv.gid, kv.me, kv.config.Shards, newConfig.Shards)
 
 	// Send config args
 	args := ConfigArgs{
@@ -182,17 +186,17 @@ func (kv *ShardKV) sendShards(args *ShardsArgs, gid int) {
 		servers, exists := kv.config.Groups[gid]
 		kv.mu.Unlock()
 
-		PrintDebug("sendShards: %v -> %v, data: %v",
-			kv.gid, gid, args.Data)
 
 		if exists {
 			for si := 0; si < len(servers); si++ {
+        PrintDebug("sendShards: %v_%v -> %v_%v, (num: %v) data: %v",
+          kv.gid, kv.me, gid, si, args.CmdId, args.Data)
 				var reply ShardsReply
 
 				srv := kv.make_end(servers[si])
 				ok := srv.Call("ShardKV.ReceiveShards", args, &reply)
 				if ok && reply.Err == OK {
-					kv.completePushShards(reply.Shards)
+					kv.completePushShards(reply)
 					return
 				}
 			}
@@ -236,11 +240,14 @@ func (kv *ShardKV) getReceivers() map[int]bool {
 }
 
 // Caller must not hold mutex.
-func (kv *ShardKV) completePushShards(shards []int) {
+func (kv *ShardKV) completePushShards(reply ShardsReply) {
 	PrintDebugGreen(
-		"%v_%v: complete shards: %v", kv.gid, kv.me, shards)
+    "%v_%v: complete shards: %v, config: %v",
+      kv.gid, kv.me, reply.Shards, reply.Num)
 	args := ShardStateArgs{
-		Shards: shards,
+    Gid:    reply.Gid,
+    Num:    reply.Num,
+		Shards: reply.Shards,
 	}
 
 	for {
@@ -377,7 +384,7 @@ func (kv *ShardKV) Reply(err Err) Reply {
 func (kv *ShardKV) processOp(op Op) Reply {
 	// TODO: Probably we don't need to check it.
 	prevCmdId, _ := kv.history[op.ClerkId]
-	if op.Type != OpReceiveShards && prevCmdId >= op.CmdId {
+	if op.Type == OpPutAppend && prevCmdId >= op.CmdId {
 		PrintDebugYellow(
 			"%v_%v: %v is committed, clerkId: %v, cmdId: %v",
 			kv.gid, kv.me, op.Type, op.ClerkId, op.CmdId)
@@ -397,7 +404,7 @@ func (kv *ShardKV) processOp(op Op) Reply {
 	case OpPutAppend:
 		kv.processPutAppend(&op.PutAppendArg, &reply.PutAppendReply)
 	case OpReceiveShards:
-		kv.processShards(&op.ShardsArg, &reply.ShardsReply)
+		kv.receiveShards(&op.ShardsArg, &reply.ShardsReply)
 	case OpConfig:
 		kv.processConfig(&op.ConfigArg, &reply.ConfigReply)
 	case OpShardState:
@@ -411,12 +418,17 @@ func (kv *ShardKV) processShardState(
   reply *ShardStateReply,
 ) {
   PrintDebug(
-    "%v_%v: update shard state: %v",
-    kv.gid, kv.me, args.Shards)
+    "%v_%v: process shard state: config num: %v, shards: %v",
+    kv.gid, kv.me, args.Num, args.Shards)
 
-	for _, shard := range args.Shards {
-		kv.shardState[shard] = ShardReady
-	}
+  if args.Num == kv.config.Num {
+    PrintDebug(
+      "%v_%v: update shard state: %v",
+      kv.gid, kv.me, args.Shards)
+    for _, shard := range args.Shards {
+      kv.shardState[shard] = ShardReady
+    }
+  }
   reply.Err = OK
 }
 
@@ -448,8 +460,8 @@ func (kv *ShardKV) correctShard(key string) bool {
 
   if gid != kv.gid {
 		PrintDebugRed(
-			"%v_%v: Get Wrong group: me: %v, target: %v",
-			kv.gid, kv.me, kv.gid, gid)
+      "%v_%v: Get Wrong group: key: %v(shard: %v) me: %v, target: %v",
+			kv.gid, kv.me, key, shard, kv.gid, gid)
   }
 	return gid == kv.gid
 }
@@ -487,15 +499,12 @@ func (kv *ShardKV) processPutAppend(
 		kv.data[args.Key] = oldValue + args.Value
 	}
 	reply.Err = OK
-	PrintDebug(
-		"%v_%v: PutAppend: key: %v (shard: %v) -> value: %v cmdId: %v done",
-		kv.gid, kv.me, args.Key, key2shard(args.Key), args.Value,
-		args.CmdId)
 }
 
 // Caller must hold the mutex.
 func (kv *ShardKV) processConfig(args *ConfigArgs, reply *ConfigReply) {
-	PrintDebug("%v_%v: processConfig: shard: %v", kv.gid, kv.me, args.Shards)
+  PrintDebug("%v_%v: processConfig: num: %v shard: %v",
+    kv.gid, kv.me, args.Num, args.Shards)
 
 	kv.saveShards(args)
 	kv.updateShardState(args.Shards[:])
@@ -571,6 +580,9 @@ func (kv *ShardKV) needUpdateShards(
 
   for _, shard := range receiveShards {
     if kv.shardState[shard] == ShardReady {
+      PrintDebugYellow(
+        "%v_%v: skip receiveShards, receive shards %v",
+        kv.gid, kv.me, receiveShards)
       return false
     }
   }
@@ -579,11 +591,13 @@ func (kv *ShardKV) needUpdateShards(
 }
 
 // Caller must hold the mutex.
-func (kv *ShardKV) processShards(
+func (kv *ShardKV) receiveShards(
 	args *ShardsArgs,
 	reply *ShardsReply,
 ) {
 	reply.Err = OK
+  reply.Gid = kv.gid
+  reply.Num = args.Num
 
 	receiveShards := kv.getReceiveShards(args.Num, args.ClerkId)
 
@@ -592,9 +606,10 @@ func (kv *ShardKV) processShards(
 		for key, value := range args.Data {
 			if kv.correctShard(key) {
 				kv.data[key] = value
+        shard := key2shard(key)
 				PrintDebug(
-					"             %v_%v: receive shards: key: %v, value: %v",
-					kv.gid, kv.me, key, value)
+          "             %v_%v: receive shards: key: %v (shard: %v), value: %v",
+					kv.gid, kv.me, key, shard, value)
 			}
 		}
 
@@ -604,7 +619,8 @@ func (kv *ShardKV) processShards(
 	}
 
 	PrintDebugYellow(
-		"%v_%v: processShards done receive shards %v", kv.gid, kv.me, receiveShards)
+		"%v_%v: receiveShards from %v done receive shards %v",
+    kv.gid, kv.me, args.ClerkId, receiveShards)
 
 	reply.Shards = receiveShards
 }
@@ -638,12 +654,16 @@ func (kv *ShardKV) getReceiveShards(currNum int, from int64) []int {
 }
 
 // Caller mustn't hold the mutex.
-func (kv *ShardKV) isCommitted(clerkId int64, cmdId int64) bool {
+func (kv *ShardKV) isCommitted(op *Op) bool {
+  if op.Type == OpReceiveShards || op.Type == OpShardState {
+    return false
+  }
+
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	prevCmdId, _ := kv.history[clerkId]
-	return prevCmdId >= cmdId
+	prevCmdId, _ := kv.history[op.ClerkId]
+	return prevCmdId >= op.CmdId
 }
 
 func (kv *ShardKV) setHandler(index int, handler *chan Reply) {
@@ -671,7 +691,7 @@ func (kv *ShardKV) deleteHandler(index int) {
 }
 
 func (kv *ShardKV) commitOp(op *Op) Reply {
-	if op.Type != OpReceiveShards && kv.isCommitted(op.ClerkId, op.CmdId) {
+	if kv.isCommitted(op) {
 		PrintDebugYellow(
 			"%v_%v: op (clerkId %v, cmdId %v) is committed",
 			kv.gid, kv.me, op.ClerkId, op.CmdId)
@@ -761,7 +781,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *ShardKV) ReceiveShards(args *ShardsArgs, reply *ShardsReply) {
 	PrintDebugYellow(
-		"%v_%v: receive shards. config num: %v", kv.gid, kv.me, args.Num)
+		"%v_%v: receive shards from %v. config num: %v",
+    kv.gid, kv.me, args.ClerkId, args.Num)
 
 	op := Op{
 		From:      kv.gid,
