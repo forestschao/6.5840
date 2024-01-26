@@ -135,7 +135,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
           ck.leaderId = (ck.leaderId + 1) % len(servers)
 				} else {
           ck.leaderId = 0
-          args.CmdId = ck.getCmdId()
 					break
         }
 			}

@@ -65,6 +65,7 @@ type ShardsArgs struct {
   CmdId   int64
   Num     int
   Data    map[string]string
+  History map[int64]int64
 }
 
 type ShardsReply struct {
