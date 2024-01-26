@@ -14,7 +14,7 @@ import (
 	"6.5840/shardctrler"
 )
 
-const DebugMode = true
+const DebugMode = false
 
 func PrintDebug(format string, a ...interface{}) {
 	PrintDebugInternal("\033[0m", format, a...)
@@ -207,13 +207,18 @@ func (kv *ShardKV) sendShards(args *ShardsArgs, gid int) {
 
 func (kv *ShardKV) pushShards() {
 	for {
+		time.Sleep(100 * time.Millisecond)
+    _, isLeader := kv.rf.GetState()
+    if !isLeader {
+      continue
+    }
+
 		receiverGid := kv.getReceivers()
 
 		for gid, _ := range receiverGid {
 			go kv.sendShards(&kv.prevShard, gid)
 		}
 
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -395,7 +400,8 @@ func (kv *ShardKV) processOp(op Op) Reply {
 		"%v_%v: start to process: %v, clerkId: %v, cmdId: %v",
 		kv.gid, kv.me, op.Type, op.ClerkId, op.CmdId)
 
-	kv.history[op.ClerkId] = op.CmdId
+
+  kv.history[op.ClerkId] = op.CmdId
 
 	reply := kv.Reply(OK)
 	switch op.Type {
