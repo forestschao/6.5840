@@ -72,16 +72,6 @@ type Op struct {
 	ShardStateArg ShardStateArgs
 }
 
-type ShardStateArgs struct {
-  Gid    int
-  Num    int
-	Shards []int
-}
-
-type ShardStateReply struct {
-	Err
-}
-
 type Reply struct {
 	GetReply        GetReply
 	PutAppendReply  PutAppendReply
@@ -112,7 +102,6 @@ type ShardKV struct {
 	sm        *shardctrler.Clerk
 	config    shardctrler.Config
 	prevShard ShardsArgs
-	receivers map[int]int // Shard Id -> Receiver GID
 }
 
 func (kv *ShardKV) receiveConfig() {
@@ -146,13 +135,6 @@ func (kv *ShardKV) getNextConfig(
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-  // Check whether server is ready to get new config.
-	// if it is waiting for shards or sending shards,
-	// do not reconfig.
-  if !kv.isShardReady() {
-    return false
-  }
-
 	nextConfigNum := kv.config.Num + 1
 	*newConfig = kv.sm.Query(nextConfigNum)
 
@@ -179,100 +161,90 @@ func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
 		ConfigArg: args,
 	}
 
-  for {
-    reply := kv.commitOp(&op).ConfigReply
+  // If it fails to commit reconfig, receiveConfig will send
+  // config again in the next run. No need to add for loop
+  // here.
+  kv.commitOp(&op)
+}
 
-    if reply.Err == ErrWrongLeader || reply.Err == OK {
+func (kv *ShardKV) pushShards() {
+	for {
+		receivers := kv.getReceivers()
+
+		for gid, _ := range receivers {
+			go kv.pushShardsToGroup(&kv.prevShard, gid)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) pushShardsToGroup(args *ShardsArgs, gid int) {
+  kv.mu.Lock()
+  servers, ok := kv.config.Groups[gid]
+  kv.mu.Unlock()
+
+  if !ok {
+    return
+  }
+
+  for si := 0; si < len(servers); si++ {
+    PrintDebug("sendShards: %v_%v -> %v_%v, (num: %v) data: %v",
+      kv.gid, kv.me, gid, si, args.CmdId, args.Data)
+
+    var reply ShardsReply
+    srv := kv.make_end(servers[si])
+    ok := srv.Call("ShardKV.ReceiveShards", args, &reply)
+
+    if ok && reply.Err == OK {
+      kv.pushShardsDone(reply)
       return
     }
   }
 }
 
-func (kv *ShardKV) sendShards(args *ShardsArgs, gid int) {
-	for {
-		kv.mu.Lock()
-		servers, exists := kv.config.Groups[gid]
-		kv.mu.Unlock()
-
-
-		if exists {
-			for si := 0; si < len(servers); si++ {
-        PrintDebug("sendShards: %v_%v -> %v_%v, (num: %v) data: %v",
-          kv.gid, kv.me, gid, si, args.CmdId, args.Data)
-				var reply ShardsReply
-
-				srv := kv.make_end(servers[si])
-				ok := srv.Call("ShardKV.ReceiveShards", args, &reply)
-				if ok && reply.Err == OK {
-					kv.completePushShards(reply)
-					return
-				}
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (kv *ShardKV) pushShards() {
-	for {
-		receiverGid := kv.getReceivers()
-
-		for gid, _ := range receiverGid {
-			go kv.sendShards(&kv.prevShard, gid)
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
 // Caller must not hold mutex.
 // Deduplicate receiver gid. Returns empty if not leader.
 func (kv *ShardKV) getReceivers() map[int]bool {
-	receiverGid := make(map[int]bool)
-
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
-		return receiverGid
+		return make(map[int]bool)
 	}
+
+	receivers := make(map[int]bool)
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	for shard, state := range kv.shardState {
 		if state == ShardHandoff {
-			gid := kv.receivers[shard]
-			receiverGid[gid] = true
+			gid := kv.config.Shards[shard]
+			receivers[gid] = true
 		}
 	}
-	return receiverGid
+	return receivers
 }
 
 // Caller must not hold mutex.
-func (kv *ShardKV) completePushShards(reply ShardsReply) {
-	PrintDebugGreen(
-    "%v_%v: complete shards: %v, config: %v",
-      kv.gid, kv.me, reply.Shards, reply.Num)
+func (kv *ShardKV) pushShardsDone(reply ShardsReply) {
+	PrintDebugGreen("%v_%v: complete shards: %v, config: %v",
+    kv.gid, kv.me, reply.Shards, reply.Num)
+
 	args := ShardStateArgs{
     Gid:    reply.Gid,
     Num:    reply.Num,
 		Shards: reply.Shards,
 	}
 
-	for {
-		op := Op{
-			From:          kv.gid,
-			Type:          OpShardState,
-			ClerkId:       int64(kv.me),
-			CmdId:         time.Now().Unix(),
-			ShardStateArg: args,
-		}
+  op := Op{
+    From:          kv.gid,
+    Type:          OpShardState,
+    ClerkId:       int64(kv.me),
+    CmdId:         time.Now().Unix(),
+    ShardStateArg: args,
+  }
 
-		reply := kv.commitOp(&op).ShardStateReply
-
-		if reply.Err == OK || reply.Err == ErrWrongLeader {
-			break
-		}
-	}
+  kv.commitOp(&op)
 }
 
 func (kv *ShardKV) receiveMsg() {
@@ -313,8 +285,7 @@ func (kv *ShardKV) ingestSnap(snapshot []byte) {
 		d.Decode(&kv.history) != nil ||
 		d.Decode(&kv.shardState) != nil ||
     d.Decode(&kv.config) != nil ||
-		d.Decode(&kv.prevShard) != nil ||
-		d.Decode(&kv.receivers) != nil {
+		d.Decode(&kv.prevShard) != nil {
 		PrintDebug("Snapshot decode error")
 		return
 	}
@@ -362,7 +333,6 @@ func (kv *ShardKV) sendSnapshot(index int) {
 	e.Encode(&kv.shardState)
   e.Encode(&kv.config)
 	e.Encode(&kv.prevShard)
-	e.Encode(&kv.receivers)
 
 	// Compress
 	var compressedData bytes.Buffer
@@ -402,8 +372,6 @@ func (kv *ShardKV) processOp(op Op) Reply {
 	PrintDebug(
 		"%v_%v: start to process: %v, clerkId: %v, cmdId: %v",
 		kv.gid, kv.me, op.Type, op.ClerkId, op.CmdId)
-
-
 
 	reply := kv.Reply(OK)
 	switch op.Type {
@@ -457,9 +425,9 @@ func (kv *ShardKV) processShardState(
     kv.gid, kv.me, args.Num, args.Shards)
 
   if args.Num == kv.config.Num {
-    PrintDebug(
-      "%v_%v: update shard state: %v",
+    PrintDebug("%v_%v: update shard state: %v",
       kv.gid, kv.me, args.Shards)
+
     for _, shard := range args.Shards {
       kv.shardState[shard] = ShardReady
     }
@@ -541,6 +509,8 @@ func (kv *ShardKV) processConfig(args *ConfigArgs, reply *ConfigReply) {
   PrintDebug("%v_%v: processConfig: num: %v shard: %v",
     kv.gid, kv.me, args.Num, args.Shards)
 
+  // If current server is waiting for shards or handing off shards,
+  // stop reconfig.
   if !kv.isShardReady() {
     reply.Err = ErrShardNotReady
     return
@@ -548,7 +518,6 @@ func (kv *ShardKV) processConfig(args *ConfigArgs, reply *ConfigReply) {
 
 	kv.saveShards(args)
 	kv.updateShardState(args.Shards[:])
-	kv.setShardsReceivers(args.Shards[:])
 
 	// Update config.
 	kv.config.Num = args.Num
@@ -563,15 +532,16 @@ func (kv *ShardKV) processConfig(args *ConfigArgs, reply *ConfigReply) {
 	}
 
 	reply.Err = OK
-	PrintDebugYellow(
-    "%v_%v: processConfig: done: %v", kv.gid, kv.me, args.Shards)
 }
 
 func (kv *ShardKV) saveShards(newConfig *ConfigArgs) {
 	// Copy all the data of the original shards.
 	data := make(map[string]string)
 	for key, value := range kv.data {
-		if kv.correctShard(key) {
+    shard := key2shard(key)
+    currGid := kv.config.Shards[shard]
+    nextGid := newConfig.Shards[shard]
+		if currGid == kv.gid && nextGid != kv.gid {
 			data[key] = value
 		}
 	}
@@ -596,25 +566,16 @@ func (kv *ShardKV) updateShardState(newShards []int) {
 	for i, newGid := range newShards {
 		oldGid := shards[i]
 
-		if oldGid == 0 || newGid == 0 || oldGid == newGid {
+		if oldGid == 0 || newGid == 0 {
 			kv.shardState[i] = ShardReady
 		} else if oldGid == kv.gid && newGid != kv.gid {
 			kv.shardState[i] = ShardHandoff
 		} else if oldGid != kv.gid && newGid == kv.gid {
 			kv.shardState[i] = ShardWaiting
-		}
+		} else {
+			kv.shardState[i] = ShardReady
+    }
 	}
-}
-
-func (kv *ShardKV) setShardsReceivers(newShards []int) {
-	receivers := make(map[int]int)
-	for i, newGid := range newShards {
-		if kv.config.Shards[i] == kv.gid && newGid != kv.gid {
-			receivers[i] = newGid
-		}
-	}
-
-	kv.receivers = receivers
 }
 
 func (kv *ShardKV) mergeHistory(history map[int64]int64) {
@@ -634,7 +595,7 @@ func (kv *ShardKV) needUpdateShards(configNum int, shards []int) bool {
   for _, shard := range shards {
     if kv.shardState[shard] == ShardReady {
       PrintDebugYellow(
-        "%v_%v: skip receiveShards, receive shards %v",
+        "%v_%v: skip receiveShards, target shards %v is ready",
         kv.gid, kv.me, shards)
       return false
     }
@@ -644,18 +605,15 @@ func (kv *ShardKV) needUpdateShards(configNum int, shards []int) bool {
 }
 
 // Caller must hold the mutex.
-func (kv *ShardKV) receiveShards(
-	args *ShardsArgs,
-	reply *ShardsReply,
-) {
+func (kv *ShardKV) receiveShards(args *ShardsArgs, reply *ShardsReply) {
 	reply.Err = OK
   reply.Gid = kv.gid
   reply.Num = args.Num
 
-	receiveShards := kv.getReceiveShards(args.Num, args.ClerkId)
+	targetShards := kv.getTargetShards(args.Num, args.ClerkId)
 
 	// Update shard data
-  if kv.needUpdateShards(args.Num, receiveShards) {
+  if kv.needUpdateShards(args.Num, targetShards) {
     kv.mergeHistory(args.History)
 
 		for key, value := range args.Data {
@@ -668,16 +626,16 @@ func (kv *ShardKV) receiveShards(
 			}
 		}
 
-		for _, shard := range receiveShards {
+		for _, shard := range targetShards {
 			kv.shardState[shard] = ShardReady
 		}
 	}
 
 	PrintDebugYellow(
-		"%v_%v: receiveShards from %v done receive shards %v",
-    kv.gid, kv.me, args.ClerkId, receiveShards)
+		"%v_%v: receiveShards from %v done. update shards %v",
+    kv.gid, kv.me, args.ClerkId, targetShards)
 
-	reply.Shards = receiveShards
+	reply.Shards = targetShards
 }
 
 func (kv *ShardKV) getShards(configNum int) []int {
@@ -690,22 +648,21 @@ func (kv *ShardKV) getShards(configNum int) []int {
 }
 
 // Caller must hold the mutex.
-func (kv *ShardKV) getReceiveShards(currNum int, from int64) []int {
-	if currNum > kv.config.Num {
+func (kv *ShardKV) getTargetShards(configNum int, from int64) []int {
+	if configNum > kv.config.Num {
 		return make([]int, 0)
 	}
 
-	curr := kv.getShards(currNum)
-	prev := kv.getShards(currNum - 1)
+	curr := kv.getShards(configNum)
+	prev := kv.getShards(configNum - 1)
 
-	receiveShards := []int{}
+	targetShards := []int{}
 	for shard, prevGid := range prev {
-		if (prevGid == int(from) || prevGid == 0) &&
-			curr[shard] == kv.gid {
-			receiveShards = append(receiveShards, shard)
+		if prevGid == int(from) && curr[shard] == kv.gid {
+			targetShards = append(targetShards, shard)
 		}
 	}
-	return receiveShards
+	return targetShards
 }
 
 // Caller mustn't hold the mutex.

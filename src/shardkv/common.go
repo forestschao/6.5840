@@ -74,3 +74,14 @@ type ShardsReply struct {
   Num    int
   Shards []int
 }
+
+type ShardStateArgs struct {
+  Gid    int
+  Num    int
+	Shards []int
+}
+
+type ShardStateReply struct {
+	Err
+}
+
