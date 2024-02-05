@@ -94,6 +94,7 @@ type ShardKV struct {
 	data     map[string]string   // Key -> Value
 	history  map[int64]int64     // Clerk Id -> Latest CmdId
 	handlers map[int]*chan Reply // Log index -> handler
+  lastIndex int // Last applied index
 
 	shardState [shardctrler.NShards]string
 
@@ -143,8 +144,9 @@ func (kv *ShardKV) getNextConfig(
 
 func (kv *ShardKV) reconfig(newConfig *shardctrler.Config) {
 	PrintDebug(
-    "%v_%v: reconfig shards: %v\n                                  -> %v",
-    kv.gid, kv.me, kv.config.Shards, newConfig.Shards)
+    "%v_%v: reconfig(%v -> %v) shards: %v\n" +
+    "                                          -> %v",
+    kv.gid, kv.me, kv.config.Num, newConfig.Num, kv.config.Shards, newConfig.Shards)
 
 	// Send config args
 	args := ConfigArgs{
@@ -227,6 +229,10 @@ func (kv *ShardKV) getReceivers() map[int]bool {
 
 // Caller must not hold mutex.
 func (kv *ShardKV) pushShardsDone(reply ShardsReply) {
+  if reply.Err != OK {
+    return
+  }
+
 	PrintDebugGreen("%v_%v: complete shards: %v, config: %v",
     kv.gid, kv.me, reply.Shards, reply.Num)
 
@@ -240,7 +246,7 @@ func (kv *ShardKV) pushShardsDone(reply ShardsReply) {
     From:          kv.gid,
     Type:          OpShardState,
     ClerkId:       int64(kv.me),
-    CmdId:         time.Now().Unix(),
+    CmdId:         int64(reply.Num),
     ShardStateArg: args,
   }
 
@@ -250,7 +256,9 @@ func (kv *ShardKV) pushShardsDone(reply ShardsReply) {
 func (kv *ShardKV) receiveMsg() {
 	for msg := range kv.applyCh {
 		if msg.SnapshotValid {
-			kv.ingestSnap(msg.Snapshot)
+      if msg.SnapshotIndex > kv.lastIndex {
+        kv.ingestSnap(msg.Snapshot)
+      }
 		} else if msg.CommandValid {
 			kv.executeCmd(msg)
 		}
@@ -281,6 +289,21 @@ func (kv *ShardKV) ingestSnap(snapshot []byte) {
 	r := bytes.NewBuffer(decompressedData)
 	d := labgob.NewDecoder(r)
 
+  lastIndex := 0
+  if d.Decode(&lastIndex) != nil {
+		PrintDebug("Snapshot decode error")
+    return
+  }
+  if lastIndex <= kv.lastIndex {
+		PrintDebug("Snapshot has already been installed.")
+		return
+  }
+
+  PrintDebug("%v_%v ingestSnapshot: CommandIndex: index %v",
+    kv.gid, kv.me, lastIndex)
+
+  kv.lastIndex = lastIndex
+
 	if d.Decode(&kv.data) != nil ||
 		d.Decode(&kv.history) != nil ||
 		d.Decode(&kv.shardState) != nil ||
@@ -290,6 +313,8 @@ func (kv *ShardKV) ingestSnap(snapshot []byte) {
 		return
 	}
 
+  PrintDebugGreen("%v_%v: ingest snapshot: state: %v",
+    kv.gid, kv.me, kv.shardState)
 	// Clear handlers
 	for index, handler := range kv.handlers {
 		close(*handler)
@@ -306,6 +331,8 @@ func (kv *ShardKV) executeCmd(msg raft.ApplyMsg) {
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+  kv.lastIndex = msg.CommandIndex
 
 	reply := kv.processOp(op)
 
@@ -325,9 +352,12 @@ func (kv *ShardKV) needSnapshot() bool {
 }
 
 func (kv *ShardKV) sendSnapshot(index int) {
+  PrintDebug("%v_%v sendSnapshot: CommandIndex: index %v",
+    kv.gid, kv.me, index)
 	// Encode
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+	e.Encode(index)
 	e.Encode(kv.data)
 	e.Encode(kv.history)
 	e.Encode(&kv.shardState)
@@ -362,7 +392,7 @@ func (kv *ShardKV) Reply(err Err) Reply {
 func (kv *ShardKV) processOp(op Op) Reply {
 	// TODO: Probably we don't need to check it.
 	prevCmdId, _ := kv.history[op.ClerkId]
-	if op.Type == OpPutAppend && prevCmdId >= op.CmdId {
+	if op.Type != OpReceiveShards && prevCmdId >= op.CmdId {
 		PrintDebugYellow(
 			"%v_%v: %v is committed, clerkId: %v, cmdId: %v",
 			kv.gid, kv.me, op.Type, op.ClerkId, op.CmdId)
@@ -396,7 +426,13 @@ func (kv *ShardKV) processOp(op Op) Reply {
 
 func (kv *ShardKV) isExecuted(reply *Reply, opType string) bool {
   err := kv.getErr(reply, opType)
-  return opType == OpGet || err == OK
+
+  if err != ErrNoKey && err != OK {
+    PrintDebugRed("%v_%v: opType: %v is not executed",
+      kv.gid, kv.me, opType)
+  }
+
+  return err == ErrNoKey || err == OK
 }
 
 func (kv *ShardKV) getErr(reply *Reply, opType string) Err {
@@ -423,6 +459,13 @@ func (kv *ShardKV) processShardState(
   PrintDebug(
     "%v_%v: process shard state: config num: %v, shards: %v",
     kv.gid, kv.me, args.Num, args.Shards)
+
+  if args.Num > kv.config.Num {
+    PrintDebugRed(
+      "%v_%v: process shard state should not happen: " +
+      "config num: %v, shards: %v",
+      kv.gid, kv.me, args.Num, args.Shards)
+  }
 
   if args.Num == kv.config.Num {
     PrintDebug("%v_%v: update shard state: %v",
@@ -502,6 +545,10 @@ func (kv *ShardKV) processPutAppend(
 		kv.data[args.Key] = oldValue + args.Value
 	}
 	reply.Err = OK
+	PrintDebug(
+		"%v_%v: PutAppend: key: %v (shard: %v) -> value: %v cmdId: %v Succeed",
+		kv.gid, kv.me, args.Key, key2shard(args.Key), args.Value,
+		args.CmdId)
 }
 
 // Caller must hold the mutex.
@@ -511,7 +558,7 @@ func (kv *ShardKV) processConfig(args *ConfigArgs, reply *ConfigReply) {
 
   // If current server is waiting for shards or handing off shards,
   // stop reconfig.
-  if !kv.isShardReady() {
+  if !kv.isShardReady() || args.Num != kv.config.Num + 1 {
     reply.Err = ErrShardNotReady
     return
   }
@@ -589,6 +636,8 @@ func (kv *ShardKV) mergeHistory(history map[int64]int64) {
 
 func (kv *ShardKV) needUpdateShards(configNum int, shards []int) bool {
   if configNum != kv.config.Num {
+    PrintDebug("%v_%v: skip updateShards: self.config: %v, input: %v",
+      kv.gid, kv.me, kv.config.Num, configNum)
     return false
   }
 
@@ -606,11 +655,17 @@ func (kv *ShardKV) needUpdateShards(configNum int, shards []int) bool {
 
 // Caller must hold the mutex.
 func (kv *ShardKV) receiveShards(args *ShardsArgs, reply *ShardsReply) {
-	reply.Err = OK
   reply.Gid = kv.gid
   reply.Num = args.Num
 
+  if args.Num > kv.config.Num {
+    reply.Err = ErrShardNotReady
+    reply.Shards = make([]int, 0)
+    return
+  }
+
 	targetShards := kv.getTargetShards(args.Num, args.ClerkId)
+	reply.Shards = targetShards
 
 	// Update shard data
   if kv.needUpdateShards(args.Num, targetShards) {
@@ -635,7 +690,7 @@ func (kv *ShardKV) receiveShards(args *ShardsArgs, reply *ShardsReply) {
 		"%v_%v: receiveShards from %v done. update shards %v",
     kv.gid, kv.me, args.ClerkId, targetShards)
 
-	reply.Shards = targetShards
+	reply.Err = OK
 }
 
 func (kv *ShardKV) getShards(configNum int) []int {

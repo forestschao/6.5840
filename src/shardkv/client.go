@@ -94,7 +94,6 @@ func (ck *Clerk) Get(key string) string {
           ck.leaderId = (ck.leaderId + 1) % len(servers)
 				} else {
           ck.leaderId = 0
-          args.CmdId = ck.getCmdId()
 					break
         }
 			}
