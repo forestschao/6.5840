@@ -14,7 +14,7 @@ import (
 	"6.5840/shardctrler"
 )
 
-const DebugMode = true
+const DebugMode = false
 
 func PrintDebug(format string, a ...interface{}) {
 	PrintDebugInternal("\033[0m", format, a...)
@@ -91,10 +91,10 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	data     map[string]string   // Key -> Value
-	history  map[int64]int64     // Clerk Id -> Latest CmdId
-	handlers map[int]*chan Reply // Log index -> handler
-  lastIndex int // Last applied index
+	data      map[string]string   // Key -> Value
+	history   map[int64]int64     // Clerk Id -> Latest CmdId
+	handlers  map[int]*chan Reply // Log index -> handler
+  lastIndex int                 // Last applied index
 
 	shardState [shardctrler.NShards]string
 
@@ -930,6 +930,10 @@ func StartServer(
 	kv.history = make(map[int64]int64)
 	kv.handlers = make(map[int]*chan Reply)
 
+	for i := 0; i < len(kv.shardState); i++ {
+		kv.shardState[i] = ShardReady
+	}
+
 	kv.persister = persister
 	snapshot := persister.ReadSnapshot()
 	if snapshot != nil && len(snapshot) > 0 {
@@ -937,10 +941,6 @@ func StartServer(
 	}
 
 	kv.sm = shardctrler.MakeClerk(ctrlers)
-
-	for i := 0; i < len(kv.shardState); i++ {
-		kv.shardState[i] = ShardReady
-	}
 
 	go kv.receiveMsg()
 	go kv.receiveConfig()

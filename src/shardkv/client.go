@@ -111,18 +111,16 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args := PutAppendArgs{
     ClerkId: ck.me,
-    CmdId: ck.getCmdId(),
-    Key: key,
-    Value: value,
-    Op: op,
+    CmdId:   ck.getCmdId(),
+    Key:     key,
+    Value:   value,
+    Op:      op,
   }
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-      // TODO: Remember leader so that it don't need to try 
-      // every server each time.
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[ck.leaderId])
 				var reply PutAppendReply
