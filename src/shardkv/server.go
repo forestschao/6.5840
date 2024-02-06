@@ -392,7 +392,7 @@ func (kv *ShardKV) Reply(err Err) Reply {
 func (kv *ShardKV) processOp(op Op) Reply {
 	// TODO: Probably we don't need to check it.
 	prevCmdId, _ := kv.history[op.ClerkId]
-	if op.Type != OpReceiveShards && prevCmdId >= op.CmdId {
+	if op.Type != OpReceiveShards && op.Type != OpShardState && prevCmdId >= op.CmdId {
 		PrintDebugYellow(
 			"%v_%v: %v is committed, clerkId: %v, cmdId: %v",
 			kv.gid, kv.me, op.Type, op.ClerkId, op.CmdId)
