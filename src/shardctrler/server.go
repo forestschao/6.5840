@@ -172,16 +172,13 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
-  reply.Err = OK
-  if !sc.isCommitted(args.ClerkId, args.CmdId) {
-    op := Op {
-      Type:    OpQuery,
-      ClerkId: args.ClerkId,
-      CmdId:   args.CmdId,
-      QueryArgs:  *args,
-    }
-    reply.Err = sc.commitOp(&op)
+  op := Op {
+    Type:    OpQuery,
+    ClerkId: args.ClerkId,
+    CmdId:   args.CmdId,
+    QueryArgs:  *args,
   }
+  reply.Err = sc.commitOp(&op)
 
   if reply.Err != OK {
     return
@@ -206,24 +203,30 @@ func (sc *ShardCtrler) getConfig(args *QueryArgs) Config {
 
 func (sc *ShardCtrler) receiveCmd() {
   for msg := range sc.applyCh {
-    op, ok := msg.Command.(Op)
-    if !ok {
-      PrintDebug("Cannot instantiate the command")
-      return
+    sc.sendMsg(msg)
+  }
+}
+
+func (sc *ShardCtrler) sendMsg(msg raft.ApplyMsg) {
+  sc.mu.Lock()
+  defer sc.mu.Unlock()
+
+  op, ok := msg.Command.(Op)
+  if !ok {
+    PrintDebug("Cannot instantiate the command")
+    return
+  }
+
+  sc.processOp(op)
+
+  handler, exists := sc.handlers[msg.CommandIndex]
+
+  if exists {
+    select {
+    case *handler <- msg:
+    default:
+      PrintDebugRed("Channel blocked.")
     }
-
-    sc.mu.Lock()
-
-    sc.processOp(op)
-
-    handler, exists := sc.handlers[msg.CommandIndex]
-
-    if exists {
-      *handler <- msg
-    }
-
-    sc.mu.Unlock()
-
   }
 }
 
