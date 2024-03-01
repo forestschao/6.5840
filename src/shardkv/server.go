@@ -266,6 +266,9 @@ func (kv *ShardKV) receiveMsg() {
 	for msg := range kv.applyCh {
 		if msg.SnapshotValid {
       if msg.SnapshotIndex > kv.lastIndex {
+        PrintDebug(
+          "%v_%v: receive snapshot: snapshot index: %v, lastIndex: %v",
+          kv.gid, kv.me, msg.SnapshotIndex, kv.lastIndex)
         kv.ingestSnap(msg.Snapshot)
       }
 		} else if msg.CommandValid {
@@ -308,7 +311,7 @@ func (kv *ShardKV) ingestSnap(snapshot []byte) {
 		return
   }
 
-  PrintDebug("%v_%v ingestSnapshot: CommandIndex: index %v",
+  PrintDebug("%v_%v: ingestSnapshot: CommandIndex: index %v",
     kv.gid, kv.me, lastIndex)
 
   kv.lastIndex = lastIndex
@@ -620,6 +623,10 @@ func (kv *ShardKV) saveShards(newConfig *ConfigArgs) {
 			data[key] = value
 		}
 	}
+
+  for key := range data {
+    delete(kv.data, key)
+  }
 
   history := make(map[int64]int64)
   for clerkId, cmdId := range kv.history {
@@ -969,6 +976,8 @@ func StartServer(
 	kv.persister = persister
 	snapshot := persister.ReadSnapshot()
 	if snapshot != nil && len(snapshot) > 0 {
+    PrintDebug(
+      "%v_%v: read snapshot when restart", kv.gid, kv.me)
 		kv.ingestSnap(snapshot)
 	}
 

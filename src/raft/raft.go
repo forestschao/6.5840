@@ -828,6 +828,7 @@ func (rf *Raft) InstallSnapshot(
   rf.lastIncludedTerm = args.LastIncludedTerm
   rf.lastIncludedIndex = args.LastIncludedIndex
   rf.startIndex = args.LastIncludedIndex + 1
+	rf.lastApplied = rf.startIndex - 1
   rf.snapshot = clone(args.Data)
 
   rf.persist()
@@ -892,9 +893,9 @@ func (rf *Raft) commit() {
 
 
     for rf.lastApplied < commitIndex {
-      rf.lastApplied++
-
       rf.mu.Lock()
+
+      rf.lastApplied++
 
       arrayIndex := rf.getArrayIndex(rf.lastApplied)
       log := rf.logs[arrayIndex]
